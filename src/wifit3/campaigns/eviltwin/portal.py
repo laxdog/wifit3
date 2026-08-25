@@ -23,10 +23,12 @@ logger = logging.getLogger(__name__)
 class PortalStack:
     def __init__(self, twin_iface, bssid: bytes, ssid: str, tap_name: str = "wifit3tap0",
                 template: PortalTemplate = PortalTemplate.PASSWORD,
-                on_submit: Optional[Callable[[dict], None]] = None):
+                on_submit: Optional[Callable[[dict], None]] = None,
+                page_override: Optional[str] = None):
+        page = page_override if page_override is not None else render(template, ssid)
         self.bridge = IpBridge(twin_iface, bssid, tap_name)
         self.dns = DnsServer(tap_name, answer_ip=SERVER_IP)
-        self.http = HttpPortalServer(tap_name, page=render(template, ssid), on_submit=on_submit)
+        self.http = HttpPortalServer(tap_name, page=page, on_submit=on_submit)
         self.nat = NatGateway(tap_name, SUBNET)
         self.nat_error: Optional[str] = None
         self._http_started = False

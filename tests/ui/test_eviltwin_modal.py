@@ -2,7 +2,7 @@ import re
 from types import SimpleNamespace
 
 from textual.app import App
-from textual.widgets import Input, Select
+from textual.widgets import Checkbox, Input, Select
 
 from wifit3.chips.driver import FakeMacSupport
 from wifit3.campaigns.eviltwin import EvilTwinPreset, PuntMode, PortalTemplate
@@ -208,3 +208,42 @@ async def test_secured_target_has_no_portal_template_row():
         await pilot.pause()
 
     assert result and result[0].ip_layer is False
+
+
+async def test_single_card_open_target_has_no_clone_checkbox():
+    a = _mounted_iface("Card A")
+    target = _mounted_target(akm_suites=())
+    result = []
+
+    class _Host(App):
+        def on_mount(self) -> None:
+            self.push_screen(EvilTwinInputModal(target, [a]), result.append)
+
+    async with _Host().run_test(size=(100, 50)) as pilot:
+        await pilot.pause()
+        modal = pilot.app.screen
+        assert len(modal.query("#clone-real-portal")) == 0    # no spare radio for the fetch
+        await pilot.click("#btn-start")
+        await pilot.pause()
+
+    assert result and result[0].clone_real_portal is False
+
+
+async def test_dual_card_open_target_clone_checkbox_flows_through():
+    a, b = _mounted_iface("Card A"), _mounted_iface("Card B")
+    target = _mounted_target(akm_suites=())
+    result = []
+
+    class _Host(App):
+        def on_mount(self) -> None:
+            self.push_screen(EvilTwinInputModal(target, [a, b]), result.append)
+
+    async with _Host().run_test(size=(100, 50)) as pilot:
+        await pilot.pause()
+        modal = pilot.app.screen
+        modal.query_one("#clone-real-portal", Checkbox).value = True
+        await pilot.pause()
+        await pilot.click("#btn-start")
+        await pilot.pause()
+
+    assert result and result[0].clone_real_portal is True

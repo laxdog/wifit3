@@ -392,11 +392,16 @@ def derive_headline(ap, array, campaigns: Campaigns) -> list[str]:
                     "[dim]saved to captures/[/dim]"]
         portal = getattr(camp, "portal", None)
         internet = getattr(portal, "internet_shared", False)
+        if getattr(camp, "fetching_real_portal", False):
+            return ["[bold cyan]EvilTwin[/bold cyan]: cloning the real captive portal…",
+                    "[dim]associating to the real target on the punt card[/dim]"]
         if camp.client_joined:
             lines = ["[black bold on green] ✓ Client joined [/black bold on green] the open twin",
                     f"[dim]CH {camp.twin_channel} · stop when done[/dim]"]
             if internet:
                 lines.append("[dim]internet: shared[/dim]")
+            if getattr(camp, "cloned_real_portal", False):
+                lines.append("[dim]portal: cloned from the real target[/dim]")
             return lines
         stats = getattr(camp.fakeap, "stats", None)
         if stats is None:
@@ -407,6 +412,11 @@ def derive_headline(ap, array, campaigns: Campaigns) -> list[str]:
                 f"{stats.probes_wildcard} wildcard[/dim]"]
         if internet:
             lines.append("[dim]internet: shared[/dim]")
+        if getattr(camp, "cloned_real_portal", False):
+            lines.append("[dim]portal: cloned from the real target[/dim]")
+        portal_fetch_error = getattr(camp, "portal_fetch_error", None)
+        if portal_fetch_error:
+            lines.append(f"[dim]{escape(portal_fetch_error)}[/dim]")
         if getattr(camp, "ip_layer_error", None):
             lines.append(f"[dark_orange]no IP layer: {escape(camp.ip_layer_error)}[/dark_orange]")
         nat_error = getattr(portal, "nat_error", None)

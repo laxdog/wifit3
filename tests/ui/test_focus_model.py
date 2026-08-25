@@ -472,6 +472,36 @@ def test_headline_eviltwin_shows_nat_error_when_no_uplink():
     assert any("no internet" in line for line in active)
 
 
+def test_headline_shows_fetching_real_portal_while_in_flight():
+    camp = types.SimpleNamespace(captured=False, client_joined=False, fetching_real_portal=True,
+                                 twin_channel=6, fakeap=None, portal=None)
+    campaigns = fm.Campaigns(eviltwin=camp)
+    active = fm.derive_headline(_rsn_ap(), None, campaigns)
+    assert any("cloning the real captive portal" in line for line in active)
+
+
+def test_headline_shows_cloned_real_portal_once_client_joins():
+    camp = types.SimpleNamespace(captured=False, client_joined=True, fetching_real_portal=False,
+                                 cloned_real_portal=True, twin_channel=6, portal=None,
+                                 fakeap=types.SimpleNamespace(stats=types.SimpleNamespace(
+                                     auth=1, assoc=1, m2=0, probes_direct=0, probes_wildcard=1)))
+    campaigns = fm.Campaigns(eviltwin=camp)
+    active = fm.derive_headline(_rsn_ap(), None, campaigns)
+    assert any("cloned from the real target" in line for line in active)
+
+
+def test_headline_shows_portal_fetch_error_when_it_falls_back():
+    camp = types.SimpleNamespace(
+        captured=False, client_joined=False, fetching_real_portal=False, cloned_real_portal=False,
+        portal_fetch_error="couldn't clone the real portal; using the template instead",
+        twin_channel=6, portal=None, ip_layer_error=None,
+        fakeap=types.SimpleNamespace(stats=types.SimpleNamespace(
+            auth=1, assoc=1, m2=0, probes_direct=0, probes_wildcard=1)))
+    campaigns = fm.Campaigns(eviltwin=camp)
+    active = fm.derive_headline(_rsn_ap(), None, campaigns)
+    assert any("couldn't clone the real portal" in line for line in active)
+
+
 def test_derive_buttons_all_disabled_when_silenced(monkeypatch):
     """Silencing an AP disables every campaign button (deauth included)."""
     ap = _rsn_ap(akms=("PSK",))

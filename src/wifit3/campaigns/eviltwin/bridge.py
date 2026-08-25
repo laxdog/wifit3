@@ -63,5 +63,5 @@ class IpBridge:
         if not self._running or len(eth_frame) < 14:
             return
         client = eth_frame[0:6]                            # Ethernet dst; ff:ff:.. -> 802.11 broadcast
-        frame = to_dot11(bssid=self.bssid, client=client, eth_frame=eth_frame)
+        frame = to_dot11(bssid=self.bssid, station=client, eth_frame=eth_frame)
         asyncio.create_task(self.iface.send_no_wait(frame))

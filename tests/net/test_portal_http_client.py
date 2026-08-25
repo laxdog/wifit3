@@ -1,0 +1,140 @@
+"""portal_http_client: the HTTP GET/redirect logic, tested over a loopback socket (``_request``)
+and with the scoped-socket connect mocked out entirely (``fetch_portal_page``, via ``_get``) --
+neither touches a real TAP or needs CAP_NET_RAW, matching net/http_portal.py's test split."""
+import asyncio
+
+import pytest
+
+from wifit3.net import portal_http_client as phc
+from wifit3.net.http_portal import HttpPortalServer
+from wifit3.net.portal_templates import PortalTemplate, render
+
+_PORTAL_HTML = "<html>login please</html>"
+
+
+@pytest.fixture
+async def loopback_server():
+    async def handler(reader, writer):
+        request = await reader.readline()
+        path = request.decode().split()[1] if request else "/"
+        if path == "/redirect-me":
+            writer.write(b"HTTP/1.1 302 Found\r\nLocation: /\r\nContent-Length: 0\r\n\r\n")
+        elif path == "/no-content-length":
+            writer.write(b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n" + _PORTAL_HTML.encode())
+        else:
+            body = _PORTAL_HTML.encode()
+            writer.write(f"HTTP/1.1 200 OK\r\nContent-Length: {len(body)}\r\n\r\n".encode() + body)
+        await writer.drain()
+        writer.close()
+    server = await asyncio.start_server(handler, host="127.0.0.1", port=0)
+    port = server.sockets[0].getsockname()[1]
+    yield port
+    server.close()
+    await server.wait_closed()
+
+
+async def _connect(port):
+    return await asyncio.open_connection("127.0.0.1", port)
+
+
+async def test_request_parses_200_with_content_length(loopback_server):
+    reader, writer = await _connect(loopback_server)
+    status, headers, body = await phc._request(reader, writer, "x", "/", 3)
+    assert status == 200 and body == _PORTAL_HTML
+
+
+async def test_request_parses_redirect_with_location(loopback_server):
+    reader, writer = await _connect(loopback_server)
+    status, headers, body = await phc._request(reader, writer, "x", "/redirect-me", 3)
+    assert status == 302 and headers["location"] == "/"
+
+
+async def test_request_falls_back_to_read_until_close_with_no_content_length(loopback_server):
+    reader, writer = await _connect(loopback_server)
+    status, headers, body = await phc._request(reader, writer, "x", "/no-content-length", 3)
+    assert status == 200 and body == _PORTAL_HTML
+
+
+async def test_request_returns_none_status_on_garbage_response():
+    class _Reader:
+        async def readline(self):
+            return b"not an http response\r\n"
+
+    class _Writer:
+        def write(self, data):
+            pass
+
+        async def drain(self):
+            pass
+
+        def close(self):
+            pass
+
+    status, headers, body = await phc._request(_Reader(), _Writer(), "x", "/", 3)
+    assert status is None and body is None
+
+
+# ----- fetch_portal_page: redirect-following orchestration (``_get`` mocked) -----------------
+
+async def test_fetch_returns_body_on_direct_200(mocker):
+    mocker.patch.object(phc, "_get", mocker.AsyncMock(return_value=(200, {}, _PORTAL_HTML)))
+    result = await phc.fetch_portal_page("wifit3fetch0", "10.0.0.1")
+    assert result == _PORTAL_HTML
+
+
+async def test_fetch_follows_one_redirect_then_returns_body(mocker):
+    calls = []
+
+    async def fake_get(tap_name, host, port, path, timeout):
+        calls.append((host, port, path))
+        if len(calls) == 1:
+            return 302, {"location": "/login.html"}, None
+        return 200, {}, _PORTAL_HTML
+
+    mocker.patch.object(phc, "_get", fake_get)
+    result = await phc.fetch_portal_page("wifit3fetch0", "10.0.0.1")
+    assert result == _PORTAL_HTML
+    assert calls[0][2] == "/" and calls[1][2] == "/login.html"
+
+
+async def test_fetch_gives_up_after_too_many_redirects(mocker):
+    mocker.patch.object(phc, "_get", mocker.AsyncMock(
+        return_value=(302, {"location": "/"}, None)))
+    result = await phc.fetch_portal_page("wifit3fetch0", "10.0.0.1")
+    assert result is None
+
+
+async def test_fetch_does_not_chase_an_https_redirect(mocker):
+    mocker.patch.object(phc, "_get", mocker.AsyncMock(
+        return_value=(302, {"location": "https://example.com/login"}, None)))
+    result = await phc.fetch_portal_page("wifit3fetch0", "10.0.0.1")
+    assert result is None
+
+
+async def test_fetch_returns_none_when_connection_fails(mocker):
+    mocker.patch.object(phc, "_get", mocker.AsyncMock(return_value=(None, {}, None)))
+    assert await phc.fetch_portal_page("wifit3fetch0", "10.0.0.1") is None
+
+
+async def test_fetch_returns_none_for_a_non_200_non_redirect_status(mocker):
+    mocker.patch.object(phc, "_get", mocker.AsyncMock(return_value=(404, {}, "nope")))
+    assert await phc.fetch_portal_page("wifit3fetch0", "10.0.0.1") is None
+
+
+# ----- end-to-end against the real HttpPortalServer, serving a real template -------------------
+# (the same server class EvilTwin's own twin uses) -- this is the shape a real captive portal
+# clone-fetch actually exercises: our client hitting our own server's exact byte output.
+
+@pytest.mark.parametrize("template", list(PortalTemplate))
+async def test_request_retrieves_a_real_template_byte_for_byte(template):
+    page = render(template, "Airport Free WiFi")
+    srv = HttpPortalServer("wifit3tap0", page=page)
+    server = await asyncio.start_server(srv._handle, host="127.0.0.1", port=0)
+    port = server.sockets[0].getsockname()[1]
+    try:
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        status, headers, body = await phc._request(reader, writer, "127.0.0.1", "/", 3)
+        assert status == 200 and body == page
+    finally:
+        server.close()
+        await server.wait_closed()

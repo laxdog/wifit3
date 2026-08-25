@@ -17,7 +17,8 @@ from wifit3.campaigns.eviltwin import (
 )
 
 _PORTAL_TEMPLATES = [("WiFi password", PortalTemplate.PASSWORD.value),
-                     ("Email + password login", PortalTemplate.LOGIN.value)]
+                     ("Email + password login", PortalTemplate.LOGIN.value),
+                     ("Click-through / terms agreement", PortalTemplate.CLICKTHROUGH.value)]
 
 _MAC_RE = re.compile(r"^([0-9a-f]{2}:){5}[0-9a-f]{2}$")
 
@@ -123,6 +124,9 @@ class EvilTwinInputModal(ModalScreen[Optional[EvilTwinInput]]):
                     yield Label("Portal page", classes="row-label")
                     yield Select(_PORTAL_TEMPLATES, value=PortalTemplate.PASSWORD.value,
                                  allow_blank=False, id="portal-template")
+                if not self._single:                     # needs a spare radio to do the fetch on
+                    yield Checkbox("Clone the real captive portal (needs 2 cards, adds delay)",
+                                   value=False, id="clone-real-portal")
 
             with Vertical(id="punt-methods"):
                 yield Checkbox("De-authenticate", value=PuntMode.DEAUTH in d_modes,
@@ -291,11 +295,14 @@ class EvilTwinInputModal(ModalScreen[Optional[EvilTwinInput]]):
         open_target = not self.target.akm_suites
         template = (PortalTemplate(self.query_one("#portal-template", Select).value) if open_target
                    else PortalTemplate.PASSWORD)
+        clone_real_portal = (open_target and not self._single
+                            and self.query_one("#clone-real-portal", Checkbox).value)
         self.dismiss(EvilTwinInput(
             twin_iface=twin, punt_iface=punter, twin_channel=channel, twin_bssid=twin_bssid,
             punt_modes=self._punt_modes(target_client), csa_channel=None, punt_period_sec=period,
             punt_once=once, target_client=target_client,
-            ip_layer=open_target, portal_template=template))   # open target: give clients a real IP
+            ip_layer=open_target, portal_template=template,   # open target: give clients a real IP
+            clone_real_portal=clone_real_portal))
 
     def _punt_modes(self, target_client: Optional[str]) -> tuple[PuntMode, ...]:
         deauth_mode = PuntMode.DEAUTH_UNICAST if target_client else PuntMode.DEAUTH

@@ -1,8 +1,21 @@
 """PortalStack: start/stop orchestration and rollback (bridge/dns/http mocked; no real TAP or
 sockets)."""
 from wifit3.campaigns.eviltwin.portal import PortalStack
+from wifit3.net.portal_templates import PortalTemplate, render
 
 _BSSID = bytes.fromhex("9483c48c3f78")
+
+
+def test_page_override_wins_over_the_template():
+    stack = PortalStack(twin_iface=object(), bssid=_BSSID, ssid="GL-Test",
+                        page_override="<html>the real cloned page</html>")
+    assert stack.http.page == "<html>the real cloned page</html>"
+
+
+def test_no_override_falls_back_to_the_template():
+    stack = PortalStack(twin_iface=object(), bssid=_BSSID, ssid="GL-Test",
+                        template=PortalTemplate.LOGIN)
+    assert stack.http.page == render(PortalTemplate.LOGIN, "GL-Test")
 
 
 def _stack(mocker) -> PortalStack:

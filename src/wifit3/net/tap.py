@@ -57,9 +57,9 @@ class TapDevice:
     def is_open(self) -> bool:
         return self._fd is not None
 
-    def open(self, *, mac: bytes, ip: str, prefix: int = 24) -> None:
-        """Create the interface, set its hardware MAC (must equal the twin's BSSID so bridged
-        frames stay addressing-consistent), assign ``ip/prefix``, and bring it up."""
+    def open(self, *, mac: bytes, ip: Optional[str] = None, prefix: int = 24) -> None:
+        """Create the interface, set its MAC, bring it up, and (AP role) assign ``ip/prefix``.
+        Client role passes ``ip=None``; the address comes later, from ``add_address``."""
         fd = os.open("/dev/net/tun", os.O_RDWR)
         try:
             ifr = struct.pack("16sH", self.name.encode("ascii"), _IFF_TAP | _IFF_NO_PI)
@@ -78,11 +78,17 @@ class TapDevice:
             self.close()
             raise
 
-    def _configure(self, *, mac: bytes, ip: str, prefix: int) -> None:
+    def _configure(self, *, mac: bytes, ip: Optional[str], prefix: int) -> None:
         mac_str = ":".join(f"{b:02x}" for b in mac)
         _run(self.name, "link", "set", "dev", self.name, "address", mac_str)
-        _run(self.name, "addr", "add", f"{ip}/{prefix}", "dev", self.name)
+        if ip is not None:
+            _run(self.name, "addr", "add", f"{ip}/{prefix}", "dev", self.name)
         _run(self.name, "link", "set", "dev", self.name, "up")
+
+    def add_address(self, ip: str, prefix: int = 24) -> None:
+        """Client role: assign the address DHCP just leased us. Deliberately no default route:
+        the fetch only ever talks to the target's own gateway, on the connected subnet."""
+        _run(self.name, "addr", "add", f"{ip}/{prefix}", "dev", self.name)
 
     def close(self) -> None:
         self.stop_reading()

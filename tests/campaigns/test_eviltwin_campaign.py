@@ -322,6 +322,91 @@ async def test_target_client_restricts_punt_and_fakeap():
     assert camp.fakeap.target_client == _CLIENT_B
 
 
+def _dual_card_open_input(twin, punt, *, clone_real_portal=True, ip_layer=True):
+    return EvilTwinInput(twin_iface=twin, punt_iface=punt, twin_channel=1, twin_bssid=_BSSID,
+                         punt_modes=(), punt_period_sec=None, ip_layer=ip_layer,
+                         clone_real_portal=clone_real_portal)
+
+
+async def test_clone_real_portal_skipped_single_card(mocker):
+    """No spare radio to do the fetch on in single-card mode: never even attempted."""
+    array, twin = _FakeArray(), _FakeIface()
+    fetch = mocker.patch("wifit3.campaigns.eviltwin.campaign.fetch_real_portal")
+    camp = EvilTwinCampaign(array, _open_target(), _dual_card_open_input(twin, twin))
+    task = asyncio.create_task(camp._loop())
+    await asyncio.sleep(0.02)
+    camp.stopped = True
+    await task
+    await camp.teardown()
+    fetch.assert_not_called()
+    assert camp.cloned_real_portal is False and camp.portal_fetch_error is None
+
+
+async def test_clone_real_portal_skipped_when_secured(mocker):
+    array, twin, punt = _FakeArray(), _FakeIface(), _FakeIface(11)
+    fetch = mocker.patch("wifit3.campaigns.eviltwin.campaign.fetch_real_portal")
+    inp = EvilTwinInput(twin_iface=twin, punt_iface=punt, twin_channel=1, twin_bssid=_BSSID,
+                        punt_modes=(), punt_period_sec=None, ip_layer=True, clone_real_portal=True)
+    camp = EvilTwinCampaign(array, _target(), inp)      # secured target
+    task = asyncio.create_task(camp._loop())
+    await asyncio.sleep(0.02)
+    camp.stopped = True
+    await task
+    await camp.teardown()
+    fetch.assert_not_called()
+
+
+async def test_clone_real_portal_skipped_when_flag_off(mocker):
+    array, twin, punt = _FakeArray(), _FakeIface(), _FakeIface(11)
+    fetch = mocker.patch("wifit3.campaigns.eviltwin.campaign.fetch_real_portal")
+    camp = EvilTwinCampaign(array, _open_target(),
+                            _dual_card_open_input(twin, punt, clone_real_portal=False))
+    task = asyncio.create_task(camp._loop())
+    await asyncio.sleep(0.02)
+    camp.stopped = True
+    await task
+    await camp.teardown()
+    fetch.assert_not_called()
+
+
+async def test_clone_real_portal_success_marks_cloned_and_feeds_the_page(mocker):
+    array, twin, punt = _FakeArray(), _FakeIface(), _FakeIface(11)
+    fetch = mocker.patch("wifit3.campaigns.eviltwin.campaign.fetch_real_portal",
+                         mocker.AsyncMock(return_value="<html>the real page</html>"))
+    stack = mocker.MagicMock(start=mocker.AsyncMock(), stop=mocker.AsyncMock())
+    portal_stack_cls = mocker.patch("wifit3.campaigns.eviltwin.campaign.PortalStack",
+                                    return_value=stack)
+    camp = EvilTwinCampaign(array, _open_target(), _dual_card_open_input(twin, punt))
+    task = asyncio.create_task(camp._loop())
+    await asyncio.sleep(0.02)
+    camp.stopped = True
+    await task
+    await camp.teardown()
+
+    fetch.assert_awaited_once()
+    assert camp.cloned_real_portal is True and camp.portal_fetch_error is None
+    assert portal_stack_cls.call_args.kwargs["page_override"] == "<html>the real page</html>"
+
+
+async def test_clone_real_portal_failure_falls_back_to_template(mocker):
+    array, twin, punt = _FakeArray(), _FakeIface(), _FakeIface(11)
+    mocker.patch("wifit3.campaigns.eviltwin.campaign.fetch_real_portal",
+                mocker.AsyncMock(return_value=None))
+    stack = mocker.MagicMock(start=mocker.AsyncMock(), stop=mocker.AsyncMock())
+    portal_stack_cls = mocker.patch("wifit3.campaigns.eviltwin.campaign.PortalStack",
+                                    return_value=stack)
+    camp = EvilTwinCampaign(array, _open_target(), _dual_card_open_input(twin, punt))
+    task = asyncio.create_task(camp._loop())
+    await asyncio.sleep(0.02)
+    camp.stopped = True
+    await task
+    await camp.teardown()
+
+    assert camp.cloned_real_portal is False
+    assert camp.portal_fetch_error is not None
+    assert portal_stack_cls.call_args.kwargs["page_override"] is None
+
+
 async def test_run_drives_loop_and_restores_channel():
     array, twin, punt = _FakeArray(), _FakeIface(), _FakeIface(11)
     array.select_iface = lambda channel: punt        # the base _drive liveness election
