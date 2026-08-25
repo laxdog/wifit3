@@ -33,3 +33,18 @@ def test_login_template_has_both_fields():
 def test_clickthrough_template_requires_agreement_not_a_password():
     html = render(PortalTemplate.CLICKTHROUGH, "TestNet")
     assert 'name="agree"' in html and 'name="password"' not in html
+
+
+def test_voucher_template_has_only_a_code_field():
+    html = render(PortalTemplate.VOUCHER, "TestNet")
+    assert 'name="voucher"' in html and 'name="password"' not in html
+
+
+def test_phone_template_has_only_a_phone_field():
+    html = render(PortalTemplate.PHONE, "TestNet")
+    assert 'name="phone"' in html and 'name="password"' not in html
+
+
+def test_room_template_has_room_and_surname_fields():
+    html = render(PortalTemplate.ROOM, "TestNet")
+    assert 'name="room"' in html and 'name="surname"' in html
