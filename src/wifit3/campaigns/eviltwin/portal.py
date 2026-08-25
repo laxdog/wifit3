@@ -9,7 +9,7 @@ not a bring-up bug (see ``nat_error`` / ``internet_shared``).
 from __future__ import annotations
 
 import logging
-from typing import Callable, List, Optional
+from typing import Callable, Dict, List, Optional, Tuple
 
 from wifit3.campaigns.eviltwin.bridge import SERVER_IP, SUBNET, IpBridge
 from wifit3.net.dns import DnsServer
@@ -24,7 +24,8 @@ class PortalStack:
     def __init__(self, twin_iface, bssid: bytes, ssid: str, tap_name: str = "wifit3tap0",
                 template: PortalTemplate = PortalTemplate.PASSWORD,
                 on_submit: Optional[Callable[[dict], None]] = None,
-                page_override: Optional[str] = None):
+                page_override: Optional[str] = None,
+                assets: Optional[Dict[str, Tuple[str, bytes]]] = None):
         page = page_override if page_override is not None else render(template, ssid)
         # Shared with DnsServer: the moment HTTP marks a client authorized, DNS stops
         # wildcard-hijacking its queries too -- otherwise NAT's internet sharing is pointless,
@@ -32,7 +33,8 @@ class PortalStack:
         authorized: set = set()
         self.bridge = IpBridge(twin_iface, bssid, tap_name)
         self.dns = DnsServer(tap_name, answer_ip=SERVER_IP, authorized=authorized)
-        self.http = HttpPortalServer(tap_name, page=page, on_submit=on_submit, authorized=authorized)
+        self.http = HttpPortalServer(tap_name, page=page, on_submit=on_submit, authorized=authorized,
+                                     assets=assets)
         self.nat = NatGateway(tap_name, SUBNET)
         self.nat_error: Optional[str] = None
         self._http_started = False

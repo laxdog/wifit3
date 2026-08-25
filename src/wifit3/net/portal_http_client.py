@@ -10,10 +10,11 @@ from __future__ import annotations
 import asyncio
 import logging
 import socket
-from typing import Optional, Tuple
+from typing import Dict, Optional, Tuple
 from urllib.parse import urlsplit
 
 from wifit3.net.dns_client import resolve as resolve_dns
+from wifit3.net.portal_assets import extract_asset_refs, guess_content_type
 
 logger = logging.getLogger(__name__)
 
@@ -26,21 +27,51 @@ _REQUEST_PATH = "/"
 async def fetch_portal_page(tap_name: str, gateway_ip: str, *, dns_ip: Optional[str] = None,
                             path: str = _REQUEST_PATH,
                             timeout: float = _READ_TIMEOUT) -> Optional[str]:
-    """GET ``path``, following same-port redirects (resolving a hostname target via ``dns_ip``).
-    None on any failure -- always best-effort, the caller falls back to a template."""
-    host, port = gateway_ip, 80
+    """GET ``path`` as text, following same-port redirects. None on any failure -- always
+    best-effort, the caller falls back to a template."""
+    data, _host, _port = await _fetch_with_redirects(tap_name, gateway_ip, 80, path, timeout,
+                                                      dns_ip=dns_ip)
+    return data.decode("utf-8", "replace") if data is not None else None
+
+
+async def fetch_page_with_assets(tap_name: str, gateway_ip: str, *, dns_ip: Optional[str] = None,
+                                 path: str = _REQUEST_PATH, timeout: float = _READ_TIMEOUT
+                                 ) -> Tuple[Optional[str], Dict[str, Tuple[str, bytes]]]:
+    """Like ``fetch_portal_page``, but also best-effort fetches the page's own local asset refs,
+    from wherever the page itself landed (its real GatewayPort), not port 80 (redirects always)."""
+    data, host, port = await _fetch_with_redirects(tap_name, gateway_ip, 80, path, timeout,
+                                                    dns_ip=dns_ip)
+    if data is None:
+        return None, {}
+    page = data.decode("utf-8", "replace")
+    assets: Dict[str, Tuple[str, bytes]] = {}
+    for ref in extract_asset_refs(page):
+        asset_data, _h, _p = await _fetch_with_redirects(tap_name, host, port, ref, timeout,
+                                                          dns_ip=dns_ip)
+        if asset_data is not None:
+            assets[ref] = (guess_content_type(ref), asset_data)
+        else:
+            logger.info("portal_http_client: asset %s not fetched, clone will 404 it", ref)
+    return page, assets
+
+
+async def _fetch_with_redirects(tap_name: str, host: str, port: int, path: str, timeout: float,
+                                *, dns_ip: Optional[str] = None
+                                ) -> Tuple[Optional[bytes], str, int]:
+    """GET-with-redirects loop; also returns the host/port the chain landed on, so a caller
+    fetching more from the same server (page assets) can start there, not back at port 80."""
     for _ in range(_MAX_REDIRECTS):
         status, headers, body = await _get(tap_name, host, port, path, timeout, dns_ip=dns_ip)
         if status is None:
             logger.info("portal_http_client: %s:%d%s: no response (connect/request failed)",
                        host, port, path)
-            return None
+            return None, host, port
         if status in (301, 302, 303, 307, 308) and "location" in headers:
             nxt = urlsplit(headers["location"])
             if nxt.scheme not in ("", "http"):   # https: can't intercept it, not chasing it
                 logger.info("portal_http_client: %s:%d%s -> %d redirect to %s (https, not "
                            "chasing it)", host, port, path, status, headers["location"])
-                return None
+                return None, host, port
             logger.info("portal_http_client: %s:%d%s -> %d redirect to %s",
                        host, port, path, status, headers["location"])
             host = nxt.hostname or host
@@ -53,16 +84,16 @@ async def fetch_portal_page(tap_name: str, gateway_ip: str, *, dns_ip: Optional[
             continue
         if status == 200 and body:
             logger.info("portal_http_client: %s:%d%s -> 200, %d bytes", host, port, path, len(body))
-            return body
+            return body, host, port
         logger.info("portal_http_client: %s:%d%s -> %d, body=%d bytes (not usable)",
-                   host, port, path, status, len(body or ""))
-        return None
+                   host, port, path, status, len(body or b""))
+        return None, host, port
     logger.info("portal_http_client: gave up after %d redirects", _MAX_REDIRECTS)
-    return None
+    return None, host, port
 
 
 async def _get(tap_name: str, host: str, port: int, path: str, timeout: float, *,
-               dns_ip: Optional[str] = None) -> Tuple[Optional[int], dict, Optional[str]]:
+               dns_ip: Optional[str] = None) -> Tuple[Optional[int], dict, Optional[bytes]]:
     """Scoped connect (untested here, same as ``net/tap.py``'s subprocess calls: pure OS
     integration) + the actual request, which ``_request`` below does and IS unit-tested."""
     connect_ip = host if _is_ipv4(host) else await _resolve_host(tap_name, host, dns_ip, timeout)
@@ -101,7 +132,7 @@ async def _resolve_host(tap_name: str, host: str, dns_ip: Optional[str],
 
 
 async def _request(reader: asyncio.StreamReader, writer: asyncio.StreamWriter, host: str,
-                   port: int, path: str, timeout: float) -> Tuple[Optional[int], dict, Optional[str]]:
+                   port: int, path: str, timeout: float) -> Tuple[Optional[int], dict, Optional[bytes]]:
     try:
         # A bare IP in Host: on a non-80 port is not what a real browser sends (HTTP/1.1 requires
         # the port whenever it's non-default), and nodogsplash's redirect-vs-serve decision reads
@@ -143,10 +174,8 @@ async def _read_head(reader: asyncio.StreamReader, timeout: float):
     return int(parts[1]), headers
 
 
-async def _read_body(reader: asyncio.StreamReader, headers: dict, timeout: float) -> str:
+async def _read_body(reader: asyncio.StreamReader, headers: dict, timeout: float) -> bytes:
     length = headers.get("content-length")
     if length is not None and length.isdigit():
-        data = await asyncio.wait_for(reader.readexactly(min(int(length), _MAX_BODY)), timeout)
-    else:
-        data = await asyncio.wait_for(reader.read(_MAX_BODY), timeout)
-    return data.decode("utf-8", "replace")
+        return await asyncio.wait_for(reader.readexactly(min(int(length), _MAX_BODY)), timeout)
+    return await asyncio.wait_for(reader.read(_MAX_BODY), timeout)

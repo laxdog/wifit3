@@ -13,15 +13,15 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from dataclasses import dataclass
-from typing import Optional
+from dataclasses import dataclass, field
+from typing import Dict, Optional, Tuple
 
 from wifit3.campaigns.auth_assoc import Association, build_client_leaving, random_client_mac
 from wifit3.campaigns.eviltwin.client_bridge import ClientBridge
 from wifit3.dot11 import str_to_mac
 from wifit3.net.dhcp_client import DhcpLease, request_lease
 from wifit3.net.dns_client import resolve as resolve_dns
-from wifit3.net.portal_http_client import fetch_portal_page
+from wifit3.net.portal_http_client import fetch_page_with_assets
 
 logger = logging.getLogger(__name__)
 
@@ -58,6 +58,9 @@ _NOT_CAPTIVE_MARKER = "<BODY>Success</BODY>"   # the literal, un-intercepted App
 class FetchResult:
     page: Optional[str]
     status: str     # always set: the specific outcome, success or failure
+    # path -> (content-type, body) for the page's own local <img>/<link>/<script> references
+    # (icons/css/images), fetched alongside it so a served clone isn't full of broken links.
+    assets: Dict[str, Tuple[str, bytes]] = field(default_factory=dict)
 
 
 async def fetch_real_portal(array, iface, bssid: str, ssid: str, channel: int) -> FetchResult:
@@ -130,11 +133,12 @@ async def _associate_and_fetch(iface, bssid_bytes: bytes, bssid: str, ssid: str,
 async def _fetch_page(lease: DhcpLease) -> FetchResult:
     """The gateway first (many portals listen there directly); if that comes back empty and we
     have a DNS server, fall back to the probe-host approach a real device would use."""
-    page = await fetch_portal_page(TAP_NAME, lease.router, dns_ip=lease.dns, timeout=_HTTP_TIMEOUT)
+    page, assets = await fetch_page_with_assets(TAP_NAME, lease.router, dns_ip=lease.dns,
+                                                timeout=_HTTP_TIMEOUT)
     if page is not None:
-        status = f"fetched from the gateway ({len(page)} bytes)"
+        status = f"fetched from the gateway ({len(page)} bytes, {len(assets)} asset(s))"
         logger.info("eviltwin: real-portal fetch: %s", status)
-        return FetchResult(page, status)
+        return FetchResult(page, status, assets)
     if lease.dns is None:
         status = "gateway had nothing to serve, and no DNS server to try the probe-host fallback"
         logger.info("eviltwin: real-portal fetch: %s", status)
@@ -146,16 +150,16 @@ async def _fetch_page(lease: DhcpLease) -> FetchResult:
         status = f"gateway had nothing, and couldn't resolve {_PROBE_HOST} to try the fallback"
         logger.info("eviltwin: real-portal fetch: %s", status)
         return FetchResult(None, status)
-    page = await fetch_portal_page(TAP_NAME, probe_ip, dns_ip=lease.dns, path=_PROBE_PATH,
-                                   timeout=_HTTP_TIMEOUT)
+    page, assets = await fetch_page_with_assets(TAP_NAME, probe_ip, dns_ip=lease.dns,
+                                                path=_PROBE_PATH, timeout=_HTTP_TIMEOUT)
     if page is not None and _NOT_CAPTIVE_MARKER in page:
         status = "target has real internet (no captive portal to clone)"
         logger.info("eviltwin: real-portal fetch: %s", status)
         return FetchResult(None, status)
     if page is not None:
-        status = f"fetched via the probe-host fallback ({len(page)} bytes)"
+        status = f"fetched via the probe-host fallback ({len(page)} bytes, {len(assets)} asset(s))"
         logger.info("eviltwin: real-portal fetch: %s", status)
-        return FetchResult(page, status)
+        return FetchResult(page, status, assets)
     status = "gateway and the probe-host fallback both failed (HTTPS-only portal?)"
     logger.info("eviltwin: real-portal fetch: %s", status)
     return FetchResult(None, status)

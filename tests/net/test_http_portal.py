@@ -35,11 +35,15 @@ async def test_get_root_serves_the_page(server):
     assert _PAGE.encode() in resp
 
 
-async def test_get_other_path_redirects_to_root(server):
+async def test_get_check_path_redirects_to_root_when_unauthorized(server):
+    """An OS's own background connectivity-check GET must NOT count as a submission -- it fires
+    on its own, with no user interaction, so treating it as one would auto-dismiss the portal
+    before anyone ever saw or clicked anything."""
     srv, port = server
     resp = await _request(port, b"GET /hotspot-detect.html HTTP/1.1\r\nHost: x\r\n\r\n")
     assert resp.startswith(b"HTTP/1.1 302")
     assert b"Location: /" in resp
+    assert srv.submissions == []
 
 
 async def test_post_captures_submitted_fields(server):
@@ -152,6 +156,77 @@ async def test_non_apple_post_gets_the_normal_success_page(server):
     resp = await _request(port, req)
     assert resp.startswith(b"HTTP/1.1 200")
     assert b"connected" in resp.lower()
+
+
+# ----- GET-based real portals: nodogsplash and openNDS both submit their login/continue form
+# via method="get", not POST -- an unrecognized GET must authorize just like a POST would ---------
+
+async def test_unrecognized_get_path_authorizes_like_a_post_would(server):
+    """The real portal's own submit/continue link (nodogsplash's $authaction, openNDS's
+    /opennds_preauth/) is a plain GET with fields in the query string, not a POST body."""
+    srv, port = server
+    resp = await _request(port, b"GET /opennds_preauth/?fas=abc&continue=clicked HTTP/1.1\r\nHost: x\r\n\r\n")
+    assert resp.startswith(b"HTTP/1.1 200")
+    assert b"connected" in resp.lower()
+    assert srv.submissions == [{"fas": "abc", "continue": "clicked"}]
+
+
+async def test_get_submission_on_submit_callback_fires():
+    seen = []
+    srv = HttpPortalServer("wifit3tap0", page=_PAGE, on_submit=seen.append)
+    asyncio_server = await asyncio.start_server(srv._handle, host="127.0.0.1", port=0)
+    port = asyncio_server.sockets[0].getsockname()[1]
+    try:
+        await _request(port, b"GET /login?username=bob HTTP/1.1\r\nHost: x\r\n\r\n")
+    finally:
+        asyncio_server.close()
+        await asyncio_server.wait_closed()
+    assert seen == [{"username": "bob"}]
+
+
+async def test_get_submission_authorizes_so_later_requests_get_success_page(server):
+    srv, port = server
+    await _request(port, b"GET /opennds_preauth/?continue=clicked HTTP/1.1\r\nHost: x\r\n\r\n")
+    resp = await _request(port, b"GET /whatever HTTP/1.1\r\nHost: x\r\n\r\n")
+    assert resp.startswith(b"HTTP/1.1 200")
+    assert b"connected" in resp.lower()
+
+
+# ----- page assets (icons/css/images referenced by the cloned page): must be served, and must
+# NOT count as a submission -- otherwise the page's own incidental resource loads (which happen
+# the instant the browser renders it, before any user interaction) would auto-authorize -----------
+
+async def test_known_asset_is_served_without_authorizing():
+    page = '<html><link rel="stylesheet" href="/splash.css"></html>'
+    srv = HttpPortalServer("wifit3tap0", page=page,
+                           assets={"/splash.css": ("text/css", b".x{color:red}")})
+    asyncio_server = await asyncio.start_server(srv._handle, host="127.0.0.1", port=0)
+    port = asyncio_server.sockets[0].getsockname()[1]
+    try:
+        resp = await _request(port, b"GET /splash.css HTTP/1.1\r\nHost: x\r\n\r\n")
+        assert resp.startswith(b"HTTP/1.1 200")
+        assert b"Content-Type: text/css" in resp
+        assert b".x{color:red}" in resp
+        assert srv.submissions == []
+    finally:
+        asyncio_server.close()
+        await asyncio_server.wait_closed()
+
+
+async def test_referenced_but_unfetched_asset_404s_without_authorizing():
+    """The asset was referenced in the page but fetching it failed (real target down/blocked):
+    404, not a redirect-loop back to "/" and not treated as a form submission either."""
+    page = '<html><img src="/missing.jpg"></html>'
+    srv = HttpPortalServer("wifit3tap0", page=page)   # no assets provided
+    asyncio_server = await asyncio.start_server(srv._handle, host="127.0.0.1", port=0)
+    port = asyncio_server.sockets[0].getsockname()[1]
+    try:
+        resp = await _request(port, b"GET /missing.jpg HTTP/1.1\r\nHost: x\r\n\r\n")
+        assert resp.startswith(b"HTTP/1.1 404")
+        assert srv.submissions == []
+    finally:
+        asyncio_server.close()
+        await asyncio_server.wait_closed()
 
 
 async def test_malformed_request_line_closes_without_crashing(server):

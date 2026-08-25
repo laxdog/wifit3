@@ -106,6 +106,7 @@ class EvilTwinCampaign(Campaign):
         self.portal_fetch_error: Optional[str] = None
         self.portal_fetch_status: Optional[str] = None   # always set once the fetch finishes
         self._fetched_page: Optional[str] = None
+        self._fetched_assets: dict = {}
         self.fetching_real_portal = False   # True only while the fetch is actually in flight
         self.real_beacon = target.last_beacon_frame
         self.twin_beacon = beacon_clone(self.real_beacon, self.twin_channel,
@@ -135,6 +136,7 @@ class EvilTwinCampaign(Campaign):
             finally:
                 self.fetching_real_portal = False
             self._fetched_page = result.page
+            self._fetched_assets = result.assets
             self.portal_fetch_status = result.status
             if result.page is not None:
                 self.cloned_real_portal = True
@@ -216,7 +218,7 @@ class EvilTwinCampaign(Campaign):
             return
         stack = PortalStack(self.twin_iface, str_to_mac(self.twin_bssid), self.ssid,
                             template=self.portal_template, on_submit=self.portal_submissions.append,
-                            page_override=self._fetched_page)
+                            page_override=self._fetched_page, assets=self._fetched_assets)
         try:
             await stack.start()
         except Exception as exc:                                    # noqa: BLE001

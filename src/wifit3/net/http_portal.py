@@ -2,7 +2,12 @@
 client submits the form, every path except the portal root 302-redirects there -- enough to
 trigger the captive-portal flow on iOS/Android/Windows alike, since none of them will see the
 exact "you have real internet" response they're each individually checking for. GET / serves the
-portal page; POST captures whatever the form submitted and marks that client authorized.
+portal page; a POST or a GET to the real portal's own submit/continue link (nodogsplash and
+openNDS both use method="get" forms, not POST) captures whatever was submitted and marks that
+client authorized. A GET to a path referenced by the page itself (its own <img>/<link>/<script>
+assets) is served from ``assets`` instead, or 404s if fetching it failed -- neither counts as a
+submission, or the page's own incidental resource loads would auto-authorize the client before
+they ever saw or clicked anything.
 
 An authorized client is a different story: each OS keeps re-polling its own well-known
 detection URL in the background (Apple's hotspot-detect.html, Android's generate_204, Windows'
@@ -15,9 +20,10 @@ from __future__ import annotations
 import asyncio
 import logging
 import socket
-from typing import Callable, List, Optional, Set
-from urllib.parse import parse_qsl
+from typing import Callable, Dict, List, Optional, Set, Tuple
+from urllib.parse import parse_qsl, urlsplit
 
+from wifit3.net.portal_assets import extract_asset_refs
 from wifit3.net.tap import SETCAP_HINT, TapPermissionError
 
 logger = logging.getLogger(__name__)
@@ -43,7 +49,7 @@ _CAPTIVE_CHECK_RESPONSES: dict[str, tuple[int, str, str]] = {
     "/ncsi.txt": (200, "text/plain", "Microsoft NCSI"),
     "/success.txt": (200, "text/plain", "success\n"),
 }
-_STATUS_REASON = {200: "OK", 204: "No Content"}
+_STATUS_REASON = {200: "OK", 204: "No Content", 404: "Not Found"}
 
 # Apple's CNA sheet reacts to its OWN webview navigating to hotspot-detect.html and seeing the
 # exact expected body -- it closes itself right then, rather than waiting out its own background
@@ -55,7 +61,8 @@ _APPLE_CNA_UA_MARKER = "captivenetworksupport"
 
 class HttpPortalServer:
     def __init__(self, tap_name: str, *, page: str, on_submit: Optional[Callable[[dict], None]] = None,
-                authorized: Optional[Set[str]] = None):
+                authorized: Optional[Set[str]] = None,
+                assets: Optional[Dict[str, Tuple[str, bytes]]] = None):
         self.tap_name = tap_name
         self.page = page
         self.on_submit = on_submit or (lambda _fields: None)
@@ -63,6 +70,11 @@ class HttpPortalServer:
         # source IPs that have already submitted the form; shared with DnsServer when given, so
         # DNS can stop wildcard-hijacking (and start forwarding for real) the moment HTTP does.
         self._authorized: Set[str] = authorized if authorized is not None else set()
+        # path -> (content-type, body) for the page's own successfully-fetched local assets
+        # (icons/css/images); asset_refs also covers ones referenced but NOT in here (fetch
+        # failed) -- those 404 rather than being treated as a submission or looping to "/".
+        self._assets: Dict[str, Tuple[str, bytes]] = assets or {}
+        self._asset_refs: Set[str] = set(self._assets) | extract_asset_refs(page)
         self._server = None
 
     async def start(self) -> None:
@@ -94,26 +106,47 @@ class HttpPortalServer:
                 return
             headers = await self._read_headers(reader)
             body = await self._read_body(reader, headers)
+            path_only = urlsplit(path).path
             if method == "POST":
                 fields = dict(parse_qsl(body.decode("utf-8", "ignore")))
-                self.submissions.append(fields)
-                self.on_submit(fields)
-                if client_ip is not None:
-                    self._authorized.add(client_ip)
-                if _APPLE_CNA_UA_MARKER in headers.get("user-agent", "").lower():
-                    await self._redirect(writer, "/hotspot-detect.html")
-                else:
-                    await self._respond(writer, 200, _SUCCESS_PAGE)
+                await self._authorize_and_respond(writer, headers, client_ip, fields)
+            elif path_only in self._asset_refs:
+                await self._respond_asset(writer, path_only)
             elif client_ip in self._authorized:
-                await self._handle_authorized(writer, path)
-            elif path == "/":
+                await self._handle_authorized(writer, path_only)
+            elif path_only == "/":
                 await self._respond(writer, 200, self.page)
-            else:
+            elif path_only in _CAPTIVE_CHECK_RESPONSES:
                 await self._redirect(writer, "/")
+            else:
+                # Not "/", not a known OS background check, not a page asset: this is the real
+                # portal's own submit/continue link -- nodogsplash and openNDS both use
+                # method="get" forms, so the submitted fields are in the query string, not a body.
+                fields = dict(parse_qsl(urlsplit(path).query))
+                await self._authorize_and_respond(writer, headers, client_ip, fields)
         except (asyncio.TimeoutError, asyncio.IncompleteReadError, ConnectionError, OSError):
             pass
         finally:
             writer.close()
+
+    async def _authorize_and_respond(self, writer: asyncio.StreamWriter, headers: dict,
+                                     client_ip: Optional[str], fields: dict) -> None:
+        self.submissions.append(fields)
+        self.on_submit(fields)
+        if client_ip is not None:
+            self._authorized.add(client_ip)
+        if _APPLE_CNA_UA_MARKER in headers.get("user-agent", "").lower():
+            await self._redirect(writer, "/hotspot-detect.html")
+        else:
+            await self._respond(writer, 200, _SUCCESS_PAGE)
+
+    async def _respond_asset(self, writer: asyncio.StreamWriter, path: str) -> None:
+        asset = self._assets.get(path)
+        if asset is None:
+            await self._respond_raw(writer, 404, "text/plain", "Not Found")
+        else:
+            content_type, data = asset
+            await self._respond_bytes(writer, 200, content_type, data)
 
     async def _handle_authorized(self, writer: asyncio.StreamWriter, path: str) -> None:
         """Already signed in: answer each OS's own connectivity-check path with what it expects
@@ -156,7 +189,10 @@ class HttpPortalServer:
 
     async def _respond_raw(self, writer: asyncio.StreamWriter, status: int, content_type: str,
                            body: str) -> None:
-        data = body.encode("utf-8")
+        await self._respond_bytes(writer, status, content_type, body.encode("utf-8"))
+
+    async def _respond_bytes(self, writer: asyncio.StreamWriter, status: int, content_type: str,
+                             data: bytes) -> None:
         reason = _STATUS_REASON.get(status, "OK")
         writer.write(f"HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\n"
                      f"Content-Length: {len(data)}\r\nConnection: close\r\n\r\n".encode("ascii") + data)

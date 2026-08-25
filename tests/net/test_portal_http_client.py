@@ -40,7 +40,7 @@ async def _connect(port):
 async def test_request_parses_200_with_content_length(loopback_server):
     reader, writer = await _connect(loopback_server)
     status, headers, body = await phc._request(reader, writer, "x", 80, "/", 3)
-    assert status == 200 and body == _PORTAL_HTML
+    assert status == 200 and body == _PORTAL_HTML.encode()
 
 
 async def test_request_parses_redirect_with_location(loopback_server):
@@ -52,7 +52,7 @@ async def test_request_parses_redirect_with_location(loopback_server):
 async def test_request_falls_back_to_read_until_close_with_no_content_length(loopback_server):
     reader, writer = await _connect(loopback_server)
     status, headers, body = await phc._request(reader, writer, "x", 80, "/no-content-length", 3)
-    assert status == 200 and body == _PORTAL_HTML
+    assert status == 200 and body == _PORTAL_HTML.encode()
 
 
 async def test_request_sends_the_port_in_the_host_header_when_non_80(loopback_server):
@@ -88,7 +88,7 @@ async def test_request_returns_none_status_on_garbage_response():
 # ----- fetch_portal_page: redirect-following orchestration (``_get`` mocked) -----------------
 
 async def test_fetch_returns_body_on_direct_200(mocker):
-    mocker.patch.object(phc, "_get", mocker.AsyncMock(return_value=(200, {}, _PORTAL_HTML)))
+    mocker.patch.object(phc, "_get", mocker.AsyncMock(return_value=(200, {}, _PORTAL_HTML.encode())))
     result = await phc.fetch_portal_page("wifit3fetch0", "10.0.0.1")
     assert result == _PORTAL_HTML
 
@@ -100,7 +100,7 @@ async def test_fetch_follows_one_redirect_then_returns_body(mocker):
         calls.append((host, port, path))
         if len(calls) == 1:
             return 302, {"location": "/login.html"}, None
-        return 200, {}, _PORTAL_HTML
+        return 200, {}, _PORTAL_HTML.encode()
 
     mocker.patch.object(phc, "_get", fake_get)
     result = await phc.fetch_portal_page("wifit3fetch0", "10.0.0.1")
@@ -132,7 +132,7 @@ async def test_fetch_chases_a_same_scheme_redirect_to_a_non_80_port(mocker):
         calls.append((host, port, path))
         if len(calls) == 1:
             return 302, {"location": "http://10.0.0.1:2050/splash"}, None
-        return 200, {}, _PORTAL_HTML
+        return 200, {}, _PORTAL_HTML.encode()
 
     mocker.patch.object(phc, "_get", fake_get)
     result = await phc.fetch_portal_page("wifit3fetch0", "10.0.0.1")
@@ -148,7 +148,7 @@ async def test_fetch_chases_a_schemeless_redirect_to_a_non_80_port(mocker):
         calls.append((host, port, path))
         if len(calls) == 1:
             return 302, {"location": "//10.0.0.1:2050/splash"}, None
-        return 200, {}, _PORTAL_HTML
+        return 200, {}, _PORTAL_HTML.encode()
 
     mocker.patch.object(phc, "_get", fake_get)
     result = await phc.fetch_portal_page("wifit3fetch0", "10.0.0.1")
@@ -168,9 +168,54 @@ async def test_fetch_returns_none_for_a_non_200_non_redirect_status(mocker):
 
 async def test_fetch_starts_from_a_custom_path(mocker):
     """The probe-host fallback needs a non-``/`` starting path (e.g. hotspot-detect.html)."""
-    get = mocker.patch.object(phc, "_get", mocker.AsyncMock(return_value=(200, {}, _PORTAL_HTML)))
+    get = mocker.patch.object(phc, "_get", mocker.AsyncMock(return_value=(200, {}, _PORTAL_HTML.encode())))
     await phc.fetch_portal_page("wifit3fetch0", "10.0.0.1", path="/hotspot-detect.html")
     assert get.call_args.args[3] == "/hotspot-detect.html"
+
+
+# ----- fetch_page_with_assets: same-page <img>/<link>/<script> refs fetched too, from wherever
+# the page itself landed (not port 80, which just redirects any path back to the login page) -----
+
+async def test_fetch_with_assets_fetches_referenced_css_from_the_pages_own_host_and_port(mocker):
+    page_html = '<html><link rel="stylesheet" href="/splash.css"></html>'
+    calls = []
+
+    async def fake_get(tap_name, host, port, path, timeout, *, dns_ip=None):
+        calls.append((host, port, path))
+        if path == "/":
+            # the login page itself redirects off to the real GatewayPort, same as nodogsplash/openNDS
+            if len(calls) == 1:
+                return 302, {"location": "http://10.0.0.1:2050/"}, None
+            return 200, {}, page_html.encode()
+        assert (host, port) == ("10.0.0.1", 2050)   # asset fetched from the landed host:port, not :80
+        return 200, {}, b".offset{color:red}"
+
+    mocker.patch.object(phc, "_get", fake_get)
+    page, assets = await phc.fetch_page_with_assets("wifit3fetch0", "10.0.0.1")
+    assert page == page_html
+    assert assets == {"/splash.css": ("text/css", b".offset{color:red}")}
+
+
+async def test_fetch_with_assets_skips_a_ref_that_fails_to_fetch(mocker):
+    page_html = '<html><img src="/missing.jpg"></html>'
+    mocker.patch.object(phc, "_get", mocker.AsyncMock(return_value=(200, {}, page_html.encode())))
+    async_get = phc._get
+
+    async def fake_get(tap_name, host, port, path, timeout, *, dns_ip=None):
+        if path == "/missing.jpg":
+            return 404, {}, b"nope"
+        return await async_get(tap_name, host, port, path, timeout, dns_ip=dns_ip)
+
+    mocker.patch.object(phc, "_get", fake_get)
+    page, assets = await phc.fetch_page_with_assets("wifit3fetch0", "10.0.0.1")
+    assert page == page_html
+    assert assets == {}
+
+
+async def test_fetch_with_assets_returns_empty_dict_when_page_fetch_fails(mocker):
+    mocker.patch.object(phc, "_get", mocker.AsyncMock(return_value=(None, {}, None)))
+    page, assets = await phc.fetch_page_with_assets("wifit3fetch0", "10.0.0.1")
+    assert page is None and assets == {}
 
 
 # ----- hostname redirects: a Location with a hostname (not a bare IP) needs DNS, since sock_connect
@@ -225,7 +270,7 @@ async def test_request_retrieves_a_real_template_byte_for_byte(template):
     try:
         reader, writer = await asyncio.open_connection("127.0.0.1", port)
         status, headers, body = await phc._request(reader, writer, "127.0.0.1", port, "/", 3)
-        assert status == 200 and body == page
+        assert status == 200 and body == page.encode()
     finally:
         server.close()
         await server.wait_closed()

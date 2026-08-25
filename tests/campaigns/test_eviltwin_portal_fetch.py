@@ -70,7 +70,8 @@ async def test_fetch_returns_page_on_full_success(mocker):
     mocker.patch.object(pf, "ClientBridge", return_value=bridge)
     lease = mocker.MagicMock(ip="10.0.0.5", prefix=24, router="10.0.0.1")
     mocker.patch.object(pf, "request_lease", mocker.AsyncMock(return_value=lease))
-    mocker.patch.object(pf, "fetch_portal_page", mocker.AsyncMock(return_value="<html>portal</html>"))
+    mocker.patch.object(pf, "fetch_page_with_assets", mocker.AsyncMock(
+        return_value=("<html>portal</html>", {})))
 
     result = await pf.fetch_real_portal(_FakeArray(iface), iface, _BSSID, "TestNet", 6)
 
@@ -111,18 +112,20 @@ _LEASE_NO_DNS = DhcpLease(ip="10.0.0.5", prefix=24, router="10.0.0.1", dns=None,
 
 
 async def test_fetch_page_returns_gateway_page_without_probing(mocker):
-    get = mocker.patch.object(pf, "fetch_portal_page", mocker.AsyncMock(return_value="<html>x</html>"))
+    get = mocker.patch.object(pf, "fetch_page_with_assets", mocker.AsyncMock(
+        return_value=("<html>x</html>", {"/splash.css": ("text/css", b"a{}")})))
     resolve = mocker.patch.object(pf, "resolve_dns")
     result = await pf._fetch_page(_LEASE)
     assert result.page == "<html>x</html>"
+    assert result.assets == {"/splash.css": ("text/css", b"a{}")}
     assert "gateway" in result.status
     get.assert_awaited_once_with(pf.TAP_NAME, "10.0.0.1", dns_ip="10.0.0.1", timeout=pf._HTTP_TIMEOUT)
     resolve.assert_not_called()
 
 
 async def test_fetch_page_falls_back_to_probe_host_when_gateway_empty(mocker):
-    mocker.patch.object(pf, "fetch_portal_page", mocker.AsyncMock(
-        side_effect=[None, "<html>real portal</html>"]))
+    mocker.patch.object(pf, "fetch_page_with_assets", mocker.AsyncMock(
+        side_effect=[(None, {}), ("<html>real portal</html>", {})]))
     resolve = mocker.patch.object(pf, "resolve_dns", mocker.AsyncMock(return_value="17.253.0.1"))
     result = await pf._fetch_page(_LEASE)
     assert result.page == "<html>real portal</html>"
@@ -132,8 +135,9 @@ async def test_fetch_page_falls_back_to_probe_host_when_gateway_empty(mocker):
 
 async def test_fetch_page_returns_none_when_probe_finds_real_internet(mocker):
     """The un-intercepted Apple response means there's no captive portal to clone."""
-    mocker.patch.object(pf, "fetch_portal_page", mocker.AsyncMock(
-        side_effect=[None, "<HTML><HEAD><TITLE>Success</TITLE></HEAD><BODY>Success</BODY></HTML>"]))
+    mocker.patch.object(pf, "fetch_page_with_assets", mocker.AsyncMock(
+        side_effect=[(None, {}),
+                    ("<HTML><HEAD><TITLE>Success</TITLE></HEAD><BODY>Success</BODY></HTML>", {})]))
     mocker.patch.object(pf, "resolve_dns", mocker.AsyncMock(return_value="17.253.0.1"))
     result = await pf._fetch_page(_LEASE)
     assert result.page is None
@@ -141,7 +145,7 @@ async def test_fetch_page_returns_none_when_probe_finds_real_internet(mocker):
 
 
 async def test_fetch_page_skips_probe_without_dns(mocker):
-    mocker.patch.object(pf, "fetch_portal_page", mocker.AsyncMock(return_value=None))
+    mocker.patch.object(pf, "fetch_page_with_assets", mocker.AsyncMock(return_value=(None, {})))
     resolve = mocker.patch.object(pf, "resolve_dns")
     result = await pf._fetch_page(_LEASE_NO_DNS)
     assert result.page is None
@@ -150,7 +154,7 @@ async def test_fetch_page_skips_probe_without_dns(mocker):
 
 
 async def test_fetch_page_returns_none_when_probe_host_does_not_resolve(mocker):
-    mocker.patch.object(pf, "fetch_portal_page", mocker.AsyncMock(return_value=None))
+    mocker.patch.object(pf, "fetch_page_with_assets", mocker.AsyncMock(return_value=(None, {})))
     mocker.patch.object(pf, "resolve_dns", mocker.AsyncMock(return_value=None))
     result = await pf._fetch_page(_LEASE)
     assert result.page is None
@@ -158,7 +162,7 @@ async def test_fetch_page_returns_none_when_probe_host_does_not_resolve(mocker):
 
 
 async def test_fetch_page_returns_none_when_both_gateway_and_probe_fail(mocker):
-    mocker.patch.object(pf, "fetch_portal_page", mocker.AsyncMock(return_value=None))
+    mocker.patch.object(pf, "fetch_page_with_assets", mocker.AsyncMock(return_value=(None, {})))
     mocker.patch.object(pf, "resolve_dns", mocker.AsyncMock(return_value="17.253.0.1"))
     result = await pf._fetch_page(_LEASE)
     assert result.page is None
