@@ -1,8 +1,9 @@
 """Fetches whatever captive-portal HTML a real target serves, over a socket scoped
-(``SO_BINDTODEVICE``) to the client-role fetch TAP once it has a DHCP lease. No DNS needed:
-connects directly to the target's own gateway IP on port 80 -- what a captive portal intercepts
-regardless of the requested Host/path, and reachable via the plain connected-subnet route DHCP's
-address assignment already created, so no default route is needed either.
+(``SO_BINDTODEVICE``) to the client-role fetch TAP once it has a DHCP lease. Tries the target's
+own gateway IP first -- what a captive portal intercepts regardless of the requested Host/path on
+networks that host it there. A redirect can land on a hostname rather than a bare IP (common for
+cloud-hosted portals): the OS's own resolver can't be used for that lookup (not scoped to this
+TAP), so ``dns_ip`` (the lease's own DNS server) is used instead when given.
 """
 from __future__ import annotations
 
@@ -12,6 +13,8 @@ import socket
 from typing import Optional, Tuple
 from urllib.parse import urlsplit
 
+from wifit3.net.dns_client import resolve as resolve_dns
+
 logger = logging.getLogger(__name__)
 
 _READ_TIMEOUT = 8.0
@@ -20,13 +23,14 @@ _MAX_REDIRECTS = 3
 _REQUEST_PATH = "/"
 
 
-async def fetch_portal_page(tap_name: str, gateway_ip: str, *,
+async def fetch_portal_page(tap_name: str, gateway_ip: str, *, dns_ip: Optional[str] = None,
+                            path: str = _REQUEST_PATH,
                             timeout: float = _READ_TIMEOUT) -> Optional[str]:
-    """GET / from the gateway, following same-port redirects. None if nothing useful comes
-    back (no portal, or any failure) -- always best-effort, the caller falls back to a template."""
-    host, port, path = gateway_ip, 80, _REQUEST_PATH
+    """GET ``path``, following same-port redirects (resolving a hostname target via ``dns_ip``).
+    None on any failure -- always best-effort, the caller falls back to a template."""
+    host, port = gateway_ip, 80
     for _ in range(_MAX_REDIRECTS):
-        status, headers, body = await _get(tap_name, host, port, path, timeout)
+        status, headers, body = await _get(tap_name, host, port, path, timeout, dns_ip=dns_ip)
         if status is None:
             return None
         if status in (301, 302, 303, 307, 308) and "location" in headers:
@@ -40,21 +44,36 @@ async def fetch_portal_page(tap_name: str, gateway_ip: str, *,
     return None
 
 
-async def _get(tap_name: str, host: str, port: int, path: str,
-               timeout: float) -> Tuple[Optional[int], dict, Optional[str]]:
+async def _get(tap_name: str, host: str, port: int, path: str, timeout: float, *,
+               dns_ip: Optional[str] = None) -> Tuple[Optional[int], dict, Optional[str]]:
     """Scoped connect (untested here, same as ``net/tap.py``'s subprocess calls: pure OS
     integration) + the actual request, which ``_request`` below does and IS unit-tested."""
+    connect_ip = host if _is_ipv4(host) else await _resolve_host(tap_name, host, dns_ip, timeout)
+    if connect_ip is None:
+        return None, {}, None
     loop = asyncio.get_running_loop()
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_BINDTODEVICE, tap_name.encode("ascii") + b"\x00")
         sock.setblocking(False)
-        await asyncio.wait_for(loop.sock_connect(sock, (host, port)), timeout)
+        await asyncio.wait_for(loop.sock_connect(sock, (connect_ip, port)), timeout)
     except (OSError, asyncio.TimeoutError):
         sock.close()
         return None, {}, None
     reader, writer = await asyncio.open_connection(sock=sock)
     return await _request(reader, writer, host, path, timeout)
+
+
+def _is_ipv4(host: str) -> bool:
+    parts = host.split(".")
+    return len(parts) == 4 and all(p.isdigit() and 0 <= int(p) <= 255 for p in parts)
+
+
+async def _resolve_host(tap_name: str, host: str, dns_ip: Optional[str],
+                        timeout: float) -> Optional[str]:
+    if dns_ip is None:
+        return None
+    return await resolve_dns(tap_name, dns_ip, host, timeout=timeout)
 
 
 async def _request(reader: asyncio.StreamReader, writer: asyncio.StreamWriter, host: str,

@@ -1,15 +1,21 @@
-"""Captive-portal HTTP server: minimal GET/POST handling, scoped to the TAP interface. Every
-path except the portal root 302-redirects there, enough to trigger the captive-portal flow on
-iOS/Android/Windows alike, with no per-OS detection-endpoint allowlist needed, since none of them
-will see the exact "you have real internet" response they're each individually checking for. GET
-/ serves the portal page; POST captures whatever the form submitted.
+"""Captive-portal HTTP server: minimal GET/POST handling, scoped to the TAP interface. Before a
+client submits the form, every path except the portal root 302-redirects there -- enough to
+trigger the captive-portal flow on iOS/Android/Windows alike, since none of them will see the
+exact "you have real internet" response they're each individually checking for. GET / serves the
+portal page; POST captures whatever the form submitted and marks that client authorized.
+
+An authorized client is a different story: each OS keeps re-polling its own well-known
+detection URL in the background (Apple's hotspot-detect.html, Android's generate_204, Windows'
+connecttest.txt/ncsi.txt, Firefox's success.txt -- all resolve here too, via the wildcard DNS) to
+decide when to auto-dismiss its sign-in sheet. Answering those correctly once authorized is what
+makes that happen instead of leaving the user stuck looking "signed in" but still walled off.
 """
 from __future__ import annotations
 
 import asyncio
 import logging
 import socket
-from typing import Callable, List, Optional
+from typing import Callable, List, Optional, Set
 from urllib.parse import parse_qsl
 
 from wifit3.net.tap import SETCAP_HINT, TapPermissionError
@@ -24,6 +30,21 @@ _SUCCESS_PAGE = ('<!doctype html><html><head><meta charset="utf-8"><title>Connec
                  '<body style="font-family:sans-serif;text-align:center;padding-top:3em">'
                  "<h2>You're connected</h2></body></html>")
 
+# path -> (status, content-type, body) each OS's background connectivity check expects once
+# there's real internet; served verbatim only to already-authorized clients so the OS notices and
+# auto-dismisses its captive-portal sign-in UI.
+_APPLE_SUCCESS = "<HTML><HEAD><TITLE>Success</TITLE></HEAD><BODY>Success</BODY></HTML>"
+_CAPTIVE_CHECK_RESPONSES: dict[str, tuple[int, str, str]] = {
+    "/hotspot-detect.html": (200, "text/html", _APPLE_SUCCESS),
+    "/library/test/success.html": (200, "text/html", _APPLE_SUCCESS),
+    "/generate_204": (204, "text/html", ""),
+    "/gen_204": (204, "text/html", ""),
+    "/connecttest.txt": (200, "text/plain", "Microsoft Connect Test"),
+    "/ncsi.txt": (200, "text/plain", "Microsoft NCSI"),
+    "/success.txt": (200, "text/plain", "success\n"),
+}
+_STATUS_REASON = {200: "OK", 204: "No Content"}
+
 
 class HttpPortalServer:
     def __init__(self, tap_name: str, *, page: str, on_submit: Optional[Callable[[dict], None]] = None):
@@ -31,6 +52,7 @@ class HttpPortalServer:
         self.page = page
         self.on_submit = on_submit or (lambda _fields: None)
         self.submissions: List[dict] = []
+        self._authorized: Set[str] = set()     # source IPs that have already submitted the form
         self._server = None
 
     async def start(self) -> None:
@@ -54,6 +76,8 @@ class HttpPortalServer:
         self._server = None
 
     async def _handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        peer = writer.get_extra_info("peername")
+        client_ip = peer[0] if peer else None
         try:
             method, path = await self._read_request_line(reader)
             if method is None:
@@ -64,7 +88,11 @@ class HttpPortalServer:
                 fields = dict(parse_qsl(body.decode("utf-8", "ignore")))
                 self.submissions.append(fields)
                 self.on_submit(fields)
+                if client_ip is not None:
+                    self._authorized.add(client_ip)
                 await self._respond(writer, 200, _SUCCESS_PAGE)
+            elif client_ip in self._authorized:
+                await self._handle_authorized(writer, path)
             elif path == "/":
                 await self._respond(writer, 200, self.page)
             else:
@@ -73,6 +101,16 @@ class HttpPortalServer:
             pass
         finally:
             writer.close()
+
+    async def _handle_authorized(self, writer: asyncio.StreamWriter, path: str) -> None:
+        """Already signed in: answer each OS's own connectivity-check path with what it expects
+        to see when there's real internet, so it stops showing the sign-in sheet on its own."""
+        check = _CAPTIVE_CHECK_RESPONSES.get(path)
+        if check is not None:
+            status, content_type, text = check
+            await self._respond_raw(writer, status, content_type, text)
+        else:
+            await self._respond(writer, 200, _SUCCESS_PAGE)
 
     async def _read_request_line(self, reader: asyncio.StreamReader):
         line = await asyncio.wait_for(reader.readline(), _READ_TIMEOUT)
@@ -101,8 +139,13 @@ class HttpPortalServer:
         return await asyncio.wait_for(reader.readexactly(length), _READ_TIMEOUT)
 
     async def _respond(self, writer: asyncio.StreamWriter, status: int, body: str) -> None:
+        await self._respond_raw(writer, status, "text/html; charset=utf-8", body)
+
+    async def _respond_raw(self, writer: asyncio.StreamWriter, status: int, content_type: str,
+                           body: str) -> None:
         data = body.encode("utf-8")
-        writer.write(f"HTTP/1.1 {status} OK\r\nContent-Type: text/html; charset=utf-8\r\n"
+        reason = _STATUS_REASON.get(status, "OK")
+        writer.write(f"HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\n"
                      f"Content-Length: {len(data)}\r\nConnection: close\r\n\r\n".encode("ascii") + data)
         await writer.drain()
 

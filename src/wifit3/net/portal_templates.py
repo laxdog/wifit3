@@ -18,6 +18,9 @@ class PortalTemplate(enum.Enum):
     PASSWORD = "password"          # "enter this network's WiFi password" - gives the PSK directly
     LOGIN = "login"                 # generic hotel/airport-style email + password
     CLICKTHROUGH = "clickthrough"   # nodogsplash-style: agree to terms, no credential required
+    VOUCHER = "voucher"             # hotel/event-style single-use access code
+    PHONE = "phone"                  # retail/mall-style phone number "verification"
+    ROOM = "room"                    # hotel-style room number + surname
 
 
 def _password_fields():
@@ -39,10 +42,29 @@ def _clickthrough_fields():
     return fields, "Free WiFi is provided as a courtesy. Please review our terms before connecting.", "Connect"
 
 
+def _voucher_fields():
+    fields = ('<input type="text" name="voucher" placeholder="Access code" required autofocus>')
+    return fields, "Enter your access code to connect.", "Redeem"
+
+
+def _phone_fields():
+    fields = ('<input type="tel" name="phone" placeholder="Phone number" required autofocus>')
+    return fields, "Enter your phone number to get connected.", "Continue"
+
+
+def _room_fields():
+    fields = ('<input type="text" name="room" placeholder="Room number" required autofocus>'
+             '<input type="text" name="surname" placeholder="Last name" required>')
+    return fields, "Enter your room number and last name to connect.", "Connect"
+
+
 _FIELDS_BY_TEMPLATE = {
     PortalTemplate.PASSWORD: _password_fields,
     PortalTemplate.LOGIN: _login_fields,
     PortalTemplate.CLICKTHROUGH: _clickthrough_fields,
+    PortalTemplate.VOUCHER: _voucher_fields,
+    PortalTemplate.PHONE: _phone_fields,
+    PortalTemplate.ROOM: _room_fields,
 }
 
 

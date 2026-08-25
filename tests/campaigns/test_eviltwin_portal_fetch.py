@@ -2,6 +2,7 @@
 DHCP, and HTTP are all mocked -- no real hardware, sockets, or TAP touched)."""
 from wifit3.campaigns.eviltwin import portal_fetch as pf
 from wifit3.dot11 import str_to_mac
+from wifit3.net.dhcp_client import DhcpLease
 
 _BSSID = "94:83:c4:8c:3f:78"
 
@@ -88,6 +89,54 @@ async def test_fetch_never_raises_on_unexpected_error(mocker):
     iface = _FakeIface()
     mocker.patch.object(pf, "Association", side_effect=RuntimeError("boom"))
     result = await pf.fetch_real_portal(_FakeArray(iface), iface, _BSSID, "TestNet", 6)
+    assert result is None
+
+
+# ----- _fetch_page: gateway-first, probe-host fallback when that comes back empty --------------
+
+_LEASE = DhcpLease(ip="10.0.0.5", prefix=24, router="10.0.0.1", dns="10.0.0.1", server_id="10.0.0.1")
+_LEASE_NO_DNS = DhcpLease(ip="10.0.0.5", prefix=24, router="10.0.0.1", dns=None, server_id="10.0.0.1")
+
+
+async def test_fetch_page_returns_gateway_page_without_probing(mocker):
+    get = mocker.patch.object(pf, "fetch_portal_page", mocker.AsyncMock(return_value="<html>x</html>"))
+    resolve = mocker.patch.object(pf, "resolve_dns")
+    result = await pf._fetch_page(_LEASE)
+    assert result == "<html>x</html>"
+    get.assert_awaited_once_with(pf.TAP_NAME, "10.0.0.1", dns_ip="10.0.0.1", timeout=pf._HTTP_TIMEOUT)
+    resolve.assert_not_called()
+
+
+async def test_fetch_page_falls_back_to_probe_host_when_gateway_empty(mocker):
+    mocker.patch.object(pf, "fetch_portal_page", mocker.AsyncMock(
+        side_effect=[None, "<html>real portal</html>"]))
+    resolve = mocker.patch.object(pf, "resolve_dns", mocker.AsyncMock(return_value="17.253.0.1"))
+    result = await pf._fetch_page(_LEASE)
+    assert result == "<html>real portal</html>"
+    resolve.assert_awaited_once_with(pf.TAP_NAME, "10.0.0.1", pf._PROBE_HOST, timeout=pf._HTTP_TIMEOUT)
+
+
+async def test_fetch_page_returns_none_when_probe_finds_real_internet(mocker):
+    """The un-intercepted Apple response means there's no captive portal to clone."""
+    mocker.patch.object(pf, "fetch_portal_page", mocker.AsyncMock(
+        side_effect=[None, "<HTML><HEAD><TITLE>Success</TITLE></HEAD><BODY>Success</BODY></HTML>"]))
+    mocker.patch.object(pf, "resolve_dns", mocker.AsyncMock(return_value="17.253.0.1"))
+    result = await pf._fetch_page(_LEASE)
+    assert result is None
+
+
+async def test_fetch_page_skips_probe_without_dns(mocker):
+    mocker.patch.object(pf, "fetch_portal_page", mocker.AsyncMock(return_value=None))
+    resolve = mocker.patch.object(pf, "resolve_dns")
+    result = await pf._fetch_page(_LEASE_NO_DNS)
+    assert result is None
+    resolve.assert_not_called()
+
+
+async def test_fetch_page_returns_none_when_probe_host_does_not_resolve(mocker):
+    mocker.patch.object(pf, "fetch_portal_page", mocker.AsyncMock(return_value=None))
+    mocker.patch.object(pf, "resolve_dns", mocker.AsyncMock(return_value=None))
+    result = await pf._fetch_page(_LEASE)
     assert result is None
 
 

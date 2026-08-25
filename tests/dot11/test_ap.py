@@ -66,6 +66,24 @@ def test_beacon_clone_strips_sae_keeps_psk():
     assert _RSNXE not in out                          # RSN Extended Caps dropped
 
 
+def test_beacon_clone_open_twin_drops_rsn_and_clears_privacy():
+    """force_open: a WPA2 target's beacon must not still claim WPA2 once the twin goes open, or
+    the client's own OS shows a lock icon / prompts for a password that doesn't exist."""
+    cap = struct.pack("<H", 0x0011)                       # ESS + Privacy
+    beacon = bytes(34) + cap + ssid_ie("Net") + rates_ie() + ds_param_ie(11) + _RSN_PSK_SAE + _RSNXE
+    out = beacon_clone(beacon, 1, secured=False)
+    assert struct.unpack_from("<H", out, 34)[0] == 0x0001   # ESS only, Privacy cleared
+    assert b"\x00\x0f\xac\x02" not in out                    # PSK AKM (RSN IE) gone entirely
+    assert ssid_ie("Net") in out                            # everything else still cloned
+
+
+def test_beacon_clone_secured_default_keeps_privacy_bit():
+    cap = struct.pack("<H", 0x0011)
+    beacon = bytes(34) + cap + ssid_ie("Net") + rates_ie() + ds_param_ie(11) + _RSN_PSK_SAE
+    out = beacon_clone(beacon, 1)
+    assert struct.unpack_from("<H", out, 34)[0] == 0x0011    # unchanged: still secured
+
+
 def test_beacon_clone_rejects_short_beacon():
     with pytest.raises(ValueError):
         beacon_clone(bytes(20), 1)

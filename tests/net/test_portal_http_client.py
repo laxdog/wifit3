@@ -85,7 +85,7 @@ async def test_fetch_returns_body_on_direct_200(mocker):
 async def test_fetch_follows_one_redirect_then_returns_body(mocker):
     calls = []
 
-    async def fake_get(tap_name, host, port, path, timeout):
+    async def fake_get(tap_name, host, port, path, timeout, *, dns_ip=None):
         calls.append((host, port, path))
         if len(calls) == 1:
             return 302, {"location": "/login.html"}, None
@@ -119,6 +119,52 @@ async def test_fetch_returns_none_when_connection_fails(mocker):
 async def test_fetch_returns_none_for_a_non_200_non_redirect_status(mocker):
     mocker.patch.object(phc, "_get", mocker.AsyncMock(return_value=(404, {}, "nope")))
     assert await phc.fetch_portal_page("wifit3fetch0", "10.0.0.1") is None
+
+
+async def test_fetch_starts_from_a_custom_path(mocker):
+    """The probe-host fallback needs a non-``/`` starting path (e.g. hotspot-detect.html)."""
+    get = mocker.patch.object(phc, "_get", mocker.AsyncMock(return_value=(200, {}, _PORTAL_HTML)))
+    await phc.fetch_portal_page("wifit3fetch0", "10.0.0.1", path="/hotspot-detect.html")
+    assert get.call_args.args[3] == "/hotspot-detect.html"
+
+
+# ----- hostname redirects: a Location with a hostname (not a bare IP) needs DNS, since sock_connect
+# can't resolve one itself and the OS resolver isn't scoped to this TAP -----------------------
+
+async def test_get_resolves_a_hostname_target_via_the_supplied_dns_ip(mocker):
+    resolve = mocker.patch.object(phc, "resolve_dns", mocker.AsyncMock(return_value="10.0.0.9"))
+    mocker.patch.object(phc.socket, "socket", return_value=mocker.MagicMock())
+    connect_calls = []
+
+    class _FakeLoop:
+        async def sock_connect(self, sock, addr):
+            connect_calls.append(addr)
+            raise OSError("stop here: connect behavior isn't under test")
+
+    mocker.patch("asyncio.get_running_loop", return_value=_FakeLoop())
+    status, headers, body = await phc._get("wifit3fetch0", "guest.example.com", 80, "/", 3,
+                                           dns_ip="10.0.0.1")
+    assert status is None
+    resolve.assert_awaited_once_with("wifit3fetch0", "10.0.0.1", "guest.example.com", timeout=3)
+    assert connect_calls == [("10.0.0.9", 80)]
+
+
+async def test_get_gives_up_immediately_when_hostname_and_no_dns_ip():
+    status, headers, body = await phc._get("wifit3fetch0", "guest.example.com", 80, "/", 3)
+    assert status is None and headers == {} and body is None
+
+
+async def test_get_skips_resolution_for_a_bare_ip(mocker):
+    resolve = mocker.patch.object(phc, "resolve_dns")
+    mocker.patch.object(phc.socket, "socket", return_value=mocker.MagicMock())
+
+    class _FakeLoop:
+        async def sock_connect(self, sock, addr):
+            raise OSError("stop here: connect behavior isn't under test")
+
+    mocker.patch("asyncio.get_running_loop", return_value=_FakeLoop())
+    await phc._get("wifit3fetch0", "10.0.0.1", 80, "/", 3, dns_ip="10.0.0.1")
+    resolve.assert_not_called()
 
 
 # ----- end-to-end against the real HttpPortalServer, serving a real template -------------------

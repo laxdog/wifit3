@@ -18,7 +18,10 @@ from wifit3.campaigns.eviltwin import (
 
 _PORTAL_TEMPLATES = [("WiFi password", PortalTemplate.PASSWORD.value),
                      ("Email + password login", PortalTemplate.LOGIN.value),
-                     ("Click-through / terms agreement", PortalTemplate.CLICKTHROUGH.value)]
+                     ("Click-through / terms agreement", PortalTemplate.CLICKTHROUGH.value),
+                     ("Access code / voucher", PortalTemplate.VOUCHER.value),
+                     ("Phone number", PortalTemplate.PHONE.value),
+                     ("Hotel room + last name", PortalTemplate.ROOM.value)]
 
 _MAC_RE = re.compile(r"^([0-9a-f]{2}:){5}[0-9a-f]{2}$")
 
@@ -119,14 +122,15 @@ class EvilTwinInputModal(ModalScreen[Optional[EvilTwinInput]]):
                 yield Select([("All clients", "")] + [(c, c) for c in self._clients],
                              value="", allow_blank=False, id="target-client")
 
-            if not self.target.akm_suites:               # open target: the IP layer is armed too
-                with Horizontal(classes="row"):
-                    yield Label("Portal page", classes="row-label")
-                    yield Select(_PORTAL_TEMPLATES, value=PortalTemplate.PASSWORD.value,
-                                 allow_blank=False, id="portal-template")
-                if not self._single:                     # needs a spare radio to do the fetch on
-                    yield Checkbox("Clone the real captive portal (needs 2 cards, adds delay)",
-                                   value=False, id="clone-real-portal")
+            if self.target.akm_suites:                   # secured target: offer opening it up too
+                yield Checkbox("Clone as open network (no password)", value=False, id="force-open")
+
+            with Horizontal(classes="row", id="portal-template-row"):
+                yield Label("Portal page", classes="row-label")
+                yield Select(_PORTAL_TEMPLATES, value=PortalTemplate.PASSWORD.value,
+                             allow_blank=False, id="portal-template")
+            if not self._single:                         # needs a spare radio to do the fetch on
+                yield Checkbox("Clone the real portal page", value=False, id="clone-real-portal")
 
             with Vertical(id="punt-methods"):
                 yield Checkbox("De-authenticate", value=PuntMode.DEAUTH in d_modes,
@@ -149,6 +153,9 @@ class EvilTwinInputModal(ModalScreen[Optional[EvilTwinInput]]):
     def on_mount(self) -> None:
         self._sync_bssid_field()
         self._sync_warning()
+        self._sync_portal_visibility()
+        if not self._single:
+            self.query_one("#clone-real-portal", Checkbox).tooltip = "Needs 2 cards; adds delay"
         if self.target.pmf_required:                # robust-frame punts can't be forged under PMF
             self.query_one("#punt-deauth", Checkbox).tooltip = "Can't send deauths: PMF active"
             self.query_one("#punt-btm", Checkbox).tooltip = "Can't send BTMs: PMF active"
@@ -189,6 +196,27 @@ class EvilTwinInputModal(ModalScreen[Optional[EvilTwinInput]]):
         elif event.select.id == "preset-select":
             self._apply_preset(EvilTwinPreset(event.value))
         self._sync_warning()
+
+    def on_checkbox_changed(self, event: Checkbox.Changed) -> None:
+        if event.checkbox.id == "force-open":
+            self._sync_portal_visibility()
+
+    # ----- open-clone (real or forced) ----------------------------------------
+
+    def _open_effective(self) -> bool:
+        """True when the twin will actually be open: a genuinely open target, or a secured one
+        with "Clone as open network" checked."""
+        if not self.target.akm_suites:
+            return True
+        return self.query_one("#force-open", Checkbox).value
+
+    def _sync_portal_visibility(self) -> None:
+        """The portal-page picker and real-portal-clone checkbox only make sense once the twin is
+        actually open: an unforced secured target still runs the downgrade/capture flow instead."""
+        visible = self._open_effective()
+        self.query_one("#portal-template-row").display = visible
+        if not self._single:
+            self.query_one("#clone-real-portal", Checkbox).display = visible
 
     # ----- presets -------------------------------------------------------------
 
@@ -292,17 +320,18 @@ class EvilTwinInputModal(ModalScreen[Optional[EvilTwinInput]]):
             return
         _, period, once = _CYCLES[self.query_one("#punt-cycle", Select).value]
         target_client = self.query_one("#target-client", Select).value or None
-        open_target = not self.target.akm_suites
-        template = (PortalTemplate(self.query_one("#portal-template", Select).value) if open_target
+        force_open = self.target.akm_suites and self.query_one("#force-open", Checkbox).value
+        open_effective = self._open_effective()
+        template = (PortalTemplate(self.query_one("#portal-template", Select).value) if open_effective
                    else PortalTemplate.PASSWORD)
-        clone_real_portal = (open_target and not self._single
+        clone_real_portal = (open_effective and not self._single
                             and self.query_one("#clone-real-portal", Checkbox).value)
         self.dismiss(EvilTwinInput(
             twin_iface=twin, punt_iface=punter, twin_channel=channel, twin_bssid=twin_bssid,
             punt_modes=self._punt_modes(target_client), csa_channel=None, punt_period_sec=period,
             punt_once=once, target_client=target_client,
-            ip_layer=open_target, portal_template=template,   # open target: give clients a real IP
-            clone_real_portal=clone_real_portal))
+            ip_layer=open_effective, portal_template=template,  # open twin: give clients a real IP
+            clone_real_portal=clone_real_portal, force_open=bool(force_open)))
 
     def _punt_modes(self, target_client: Optional[str]) -> tuple[PuntMode, ...]:
         deauth_mode = PuntMode.DEAUTH_UNICAST if target_client else PuntMode.DEAUTH

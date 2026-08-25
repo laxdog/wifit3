@@ -198,22 +198,69 @@ to a specific card), so a joined client gets real internet, not just DHCP/DNS/a 
   stray iptables rules, `ip_forward` back to 0). Never touches the uplink's own address, routes,
   or any pre-existing firewall rule.
 
-**Stage 2b (not started) — clone the real portal.** This is the one still-open piece from
-tonight's asks. Deliberately not attempted yet: it's the biggest remaining chunk (a *client-role*
-Data-frame bridge + a DHCP client, neither of which exist — today's bridge is AP-role only), and
-rushing it risked either destabilizing the now-verified AP-role path or shipping an unverified
-client-association flow with no time left to test it properly. Windows still has no TAP (needs a
-Wintun driver install, later work); Linux only for now.
+**Stage 2b — DONE.** Clone the real portal instead of showing a generic template:
 
-1. **Client-role bridge + a DHCP client.** Associate to the *real* open target and get an IP from
-   it the same way a real device would (the `dot11/eth.py` translation is direction-agnostic, but
-   the TAP/bridge wiring today is AP-role only — this needs its own bring-up path).
-2. **Fetch the real portal, before arming the twin.** Do what a real device's OS does: hit the
-   standard captive-portal-detection URLs, follow the redirect if one fires, save the returned
-   login page and every same-origin asset it references (CSS/JS/images/fonts). No redirect means
-   no real portal — the Stage 2a generic template is already the correct fallback.
-3. **Serve the cloned page** instead of the generic template, rewriting the login form's submit
-   target to land on us if the original pointed off-portal.
+- `campaigns/eviltwin/client_bridge.py` (`ClientBridge`): the client-role mirror of `IpBridge`
+  (associate to the *real* target, bridge its Data frames to a TAP). `dot11/eth.py:to_dot11` was
+  fixed along the way — ToDS addr3 must carry the real DA per spec, not always the BSSID; the old
+  hardcoding silently dropped every broadcast DHCP exchange (confirmed on real hardware).
+- `net/dhcp_client.py`: a one-shot DHCP client. Doesn't use a bound UDP socket for send *or*
+  receive — confirmed live that a broadcast DHCP reply is never kernel-delivered to a
+  `SO_BINDTODEVICE` socket on an addressless interface, and a normal send from one picks the
+  default route's source IP instead of `0.0.0.0`. Sends are hand-built frames injected directly;
+  receives come off a queue of decoded Ethernet frames `ClientBridge` feeds it.
+- `net/portal_http_client.py` + `net/dns_client.py`: fetches whatever the target serves on port
+  80, following same-port redirects. A redirect can land on a hostname (common for cloud-hosted
+  portals) rather than a bare IP — `dns_client.py` resolves that against the target's own DHCP-
+  supplied DNS server, since the OS resolver isn't scoped to the fetch TAP. If the gateway itself
+  doesn't answer, a second attempt probes `captive.apple.com/hotspot-detect.html` (what a real
+  device does to find a portal that only intercepts traffic, not its own IP); an un-intercepted
+  literal Apple "Success" response means there's no portal to clone.
+- `campaigns/eviltwin/portal_fetch.py` (`fetch_real_portal`): orchestrates all of the above,
+  always best-effort — any failure at any stage just falls back to the generic template, never
+  blocks the twin from starting. Wired into `EvilTwinCampaign` behind
+  `EvilTwinInput.clone_real_portal` (dual-card only: no spare radio for it single-card).
+- `campaign.portal_fetch_error` / `campaign.cloned_real_portal` / `campaign.fetching_real_portal`
+  surface progress/outcome to the UI status line.
 
-New preset once Stage 2b lands: a "Captive portal (cloned)" variant of `OPEN_CLONE`, versus
-today's `OPEN_CLONE` which already gets clients an IP and a generic (not cloned) portal page.
+**Verified end-to-end on real hardware** (two AR9271s, one as the "real target" running an open
+twin of its own, the other running the fetch): full DISCOVER→OFFER→REQUEST→ACK round trip with no
+retransmission after the ACK; the ARP+TCP-connect mechanism the HTTP fetch depends on was proven
+separately over an isolated addressed TAP (the two-role test collides both roles onto the same
+`10.13.37.0/24` subnet in one netns — a same-host test artifact, not reproducible against a real,
+physically separate target).
+
+**Known limitation, not attempted:** a cloned page whose login form submits over HTTPS can't be
+intercepted — this app runs a plain HTTP portal server, and terminating TLS for an arbitrary
+hostname would need generating a matching cert and getting the client to trust it (full MITM,
+a much bigger and riskier build). `portal_fetch.py` already refuses to chase an HTTPS redirect
+when *fetching* the real portal for the same reason, so this is a symmetric, deliberate boundary
+rather than a one-sided gap. A cloned page's *non-form* assets (CSS/JS/images on other domains)
+still load normally through the shared internet connection when NAT is up, so styling is usually
+intact even though the two are unrelated mechanisms.
+
+**force_open (done, beyond the original Stage 2b scope):** `EvilTwinInput.force_open` twins a
+*secured* target open anyway (no 4-way, no capture) instead of requiring the target to already be
+open — the classic "no password" lure against a network the operator already controls or is
+authorized to test. Required fixing `dot11/ap.py:beacon_clone`, which had no way to strip the RSN
+IE / clear the Privacy bit: harmless for a genuinely open target (nothing to strip) but a real bug
+for a secured one forced open, since the twin's *beacon* would still claim WPA2 even though the
+probe/assoc responses correctly went open.
+
+**Captive-portal auto-dismiss (done, beyond the original Stage 2b scope):** `net/http_portal.py`
+now tracks which client IPs have already POSTed the form and answers each OS's own background
+connectivity-check path (Apple `hotspot-detect.html`/`success.html`, Android `generate_204`,
+Windows `connecttest.txt`/`ncsi.txt`, Firefox `success.txt`) with the literal "you have real
+internet" response once a client is authorized — otherwise the OS's own probe never stops seeing
+a redirect and its sign-in sheet never dismisses itself, even after the user submits the form.
+
+More portal templates: `VOUCHER` (access code), `PHONE` (number capture), `ROOM` (hotel room +
+surname), alongside the original `PASSWORD`/`LOGIN`/`CLICKTHROUGH`.
+
+**Considered, not built — Karma/MANA-style probe response.** Today's `FakeAP` only answers probes
+for the one specific target SSID (plus wildcard probes asking "what's nearby"). A Karma-style
+responder instead answers *any* directed probe with a matching AP, so a device with an open SSID
+in its saved-network list joins automatically without ever being near the real network. This is a
+materially different device (per-probed-SSID state, not one target) and a genuinely new attack
+mode, not a variant of the existing one — worth a class-design discussion before building, not an
+extension to slot into `FakeAP` unasked.

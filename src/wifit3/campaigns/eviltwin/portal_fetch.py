@@ -14,7 +14,8 @@ from typing import Optional
 from wifit3.campaigns.auth_assoc import Association, build_client_leaving, random_client_mac
 from wifit3.campaigns.eviltwin.client_bridge import ClientBridge
 from wifit3.dot11 import str_to_mac
-from wifit3.net.dhcp_client import request_lease
+from wifit3.net.dhcp_client import DhcpLease, request_lease
+from wifit3.net.dns_client import resolve as resolve_dns
 from wifit3.net.portal_http_client import fetch_portal_page
 
 logger = logging.getLogger(__name__)
@@ -29,6 +30,14 @@ _DHCP_TIMEOUT = 10.0
 _DHCP_RETRIES = 5
 _HTTP_TIMEOUT = 5.0
 _OVERALL_TIMEOUT = 30.0
+
+# Not every captive portal listens on its own gateway IP -- some (cloud-hosted controllers,
+# transparent proxies) only intercept traffic bound elsewhere. Apple's own probe URL is what a
+# real device hits to find one; if a real portal is present, it intercepts this exactly like it
+# would intercept anything else, and we land on it instead of Apple's own page.
+_PROBE_HOST = "captive.apple.com"
+_PROBE_PATH = "/hotspot-detect.html"
+_NOT_CAPTIVE_MARKER = "<BODY>Success</BODY>"   # the literal, un-intercepted Apple response
 
 
 async def fetch_real_portal(array, iface, bssid: str, ssid: str, channel: int) -> Optional[str]:
@@ -77,7 +86,7 @@ async def _associate_and_fetch(iface, bssid_bytes: bytes, bssid: str, ssid: str,
                 logger.info("eviltwin: real-portal fetch: no DHCP lease from the target")
                 return None
             bridge.tap.add_address(lease.ip, lease.prefix)
-            return await fetch_portal_page(TAP_NAME, lease.router, timeout=_HTTP_TIMEOUT)
+            return await _fetch_page(lease)
         finally:
             bridge.stop()
     finally:
@@ -86,3 +95,20 @@ async def _associate_and_fetch(iface, bssid_bytes: bytes, bssid: str, ssid: str,
         except Exception:                                       # noqa: BLE001
             pass
         assoc.stop()
+
+
+async def _fetch_page(lease: DhcpLease) -> Optional[str]:
+    """The gateway first (many portals listen there directly); if that comes back empty and we
+    have a DNS server, fall back to the probe-host approach a real device would use."""
+    page = await fetch_portal_page(TAP_NAME, lease.router, dns_ip=lease.dns, timeout=_HTTP_TIMEOUT)
+    if page is not None or lease.dns is None:
+        return page
+    probe_ip = await resolve_dns(TAP_NAME, lease.dns, _PROBE_HOST, timeout=_HTTP_TIMEOUT)
+    if probe_ip is None:
+        return None
+    page = await fetch_portal_page(TAP_NAME, probe_ip, dns_ip=lease.dns, path=_PROBE_PATH,
+                                   timeout=_HTTP_TIMEOUT)
+    if page is not None and _NOT_CAPTIVE_MARKER in page:
+        logger.info("eviltwin: real-portal fetch: target has no captive portal (real internet)")
+        return None
+    return page

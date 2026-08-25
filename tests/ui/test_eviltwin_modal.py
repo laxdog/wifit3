@@ -191,7 +191,7 @@ async def test_open_target_portal_template_choice_flows_through():
     assert result and result[0].portal_template is PortalTemplate.LOGIN
 
 
-async def test_secured_target_has_no_portal_template_row():
+async def test_secured_target_portal_template_row_hidden_until_forced_open():
     a = _mounted_iface("Card A")
     target = _mounted_target()                          # secured by default (akm_suites=(2,))
     result = []
@@ -203,11 +203,54 @@ async def test_secured_target_has_no_portal_template_row():
     async with _Host().run_test(size=(100, 50)) as pilot:
         await pilot.pause()
         modal = pilot.app.screen
-        assert len(modal.query("#portal-template")) == 0
+        assert modal.query_one("#portal-template-row").display is False
         await pilot.click("#btn-start")
         await pilot.pause()
 
     assert result and result[0].ip_layer is False
+    assert result[0].force_open is False
+
+
+async def test_secured_target_force_open_reveals_portal_row_and_flows_through():
+    a, b = _mounted_iface("Card A"), _mounted_iface("Card B")
+    target = _mounted_target()                          # secured (akm_suites=(2,))
+    result = []
+
+    class _Host(App):
+        def on_mount(self) -> None:
+            self.push_screen(EvilTwinInputModal(target, [a, b]), result.append)
+
+    async with _Host().run_test(size=(100, 50)) as pilot:
+        await pilot.pause()
+        modal = pilot.app.screen
+        modal.query_one("#force-open", Checkbox).value = True
+        await pilot.pause()
+        assert modal.query_one("#portal-template-row").display is True
+        assert modal.query_one("#clone-real-portal", Checkbox).display is True
+        modal.query_one("#portal-template", Select).value = PortalTemplate.LOGIN.value
+        await pilot.pause()
+        await pilot.click("#btn-start")
+        await pilot.pause()
+
+    assert result and result[0] is not None
+    assert result[0].force_open is True
+    assert result[0].ip_layer is True
+    assert result[0].portal_template is PortalTemplate.LOGIN
+
+
+async def test_open_target_has_no_force_open_checkbox():
+    a = _mounted_iface("Card A")
+    target = _mounted_target(akm_suites=())
+    result = []
+
+    class _Host(App):
+        def on_mount(self) -> None:
+            self.push_screen(EvilTwinInputModal(target, [a]), result.append)
+
+    async with _Host().run_test(size=(100, 50)) as pilot:
+        await pilot.pause()
+        modal = pilot.app.screen
+        assert len(modal.query("#force-open")) == 0
 
 
 async def test_single_card_open_target_has_no_clone_checkbox():

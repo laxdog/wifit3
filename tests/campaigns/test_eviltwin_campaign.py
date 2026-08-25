@@ -255,6 +255,25 @@ def test_open_target_fakeap_is_unsecured():
     assert camp.secured is False
 
 
+def test_force_open_twins_a_secured_target_open():
+    """The twin's own beacon (not just the responder logic) must stop claiming WPA2 too, or the
+    client's OS still shows a lock icon / expects a password that doesn't exist."""
+    array, twin, punt = _FakeArray(), _FakeIface(), _FakeIface(11)
+    inp = EvilTwinInput(twin_iface=twin, punt_iface=punt, twin_channel=1, twin_bssid=_BSSID,
+                        punt_modes=(), force_open=True)
+    camp = EvilTwinCampaign(array, _target(), inp)          # secured target
+    assert camp.secured is False
+    cap = struct.unpack_from("<H", camp.twin_beacon, 34)[0]
+    assert not cap & 0x0010                                  # Privacy bit cleared
+    assert GENERIC_RSN_IE not in camp.twin_beacon
+
+
+def test_force_open_false_leaves_secured_target_secured():
+    array, twin, punt = _FakeArray(), _FakeIface(), _FakeIface(11)
+    camp = EvilTwinCampaign(array, _target(), _input(twin, punt, modes=()))
+    assert camp.secured is True
+
+
 async def test_ip_layer_off_by_default_even_for_open_target():
     """``EvilTwinInput.ip_layer`` defaults False: constructing a campaign never touches a real
     TAP device unless the caller (the modal, for an open target) explicitly opts in."""
@@ -354,6 +373,25 @@ async def test_clone_real_portal_skipped_when_secured(mocker):
     await task
     await camp.teardown()
     fetch.assert_not_called()
+
+
+async def test_clone_real_portal_allowed_on_secured_target_when_forced_open(mocker):
+    array, twin, punt = _FakeArray(), _FakeIface(), _FakeIface(11)
+    fetch = mocker.patch("wifit3.campaigns.eviltwin.campaign.fetch_real_portal",
+                         mocker.AsyncMock(return_value="<html>the real page</html>"))
+    stack = mocker.MagicMock(start=mocker.AsyncMock(), stop=mocker.AsyncMock())
+    mocker.patch("wifit3.campaigns.eviltwin.campaign.PortalStack", return_value=stack)
+    inp = EvilTwinInput(twin_iface=twin, punt_iface=punt, twin_channel=1, twin_bssid=_BSSID,
+                        punt_modes=(), punt_period_sec=None, ip_layer=True,
+                        clone_real_portal=True, force_open=True)
+    camp = EvilTwinCampaign(array, _target(), inp)      # secured target, forced open
+    task = asyncio.create_task(camp._loop())
+    await asyncio.sleep(0.02)
+    camp.stopped = True
+    await task
+    await camp.teardown()
+    fetch.assert_awaited_once()
+    assert camp.cloned_real_portal is True
 
 
 async def test_clone_real_portal_skipped_when_flag_off(mocker):
