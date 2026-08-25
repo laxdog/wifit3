@@ -8,7 +8,11 @@ from .punter import Punter, PuntMode
 from .campaign import (
     EvilTwinCampaign, EvilTwinInput, default_punt_modes, csa_target_channel,
 )
+from .presets import EvilTwinPreset, PresetPlan, PRESET_LABELS, PRESET_PLANS, eligible_presets
+from wifit3.net.portal_templates import PortalTemplate
 
 __all__ = ["FakeAP", "FakeApStats", "ClientProgress", "ClientPhase",
            "Punter", "PuntMode",
-           "EvilTwinCampaign", "EvilTwinInput", "default_punt_modes", "csa_target_channel"]
+           "EvilTwinCampaign", "EvilTwinInput", "default_punt_modes", "csa_target_channel",
+           "EvilTwinPreset", "PresetPlan", "PRESET_LABELS", "PRESET_PLANS", "eligible_presets",
+           "PortalTemplate"]

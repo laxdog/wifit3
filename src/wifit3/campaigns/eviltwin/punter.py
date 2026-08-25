@@ -18,7 +18,8 @@ _DEAUTH_REASON = 7                               # class-3 frame from a nonassoc
 
 
 class PuntMode(enum.Enum):
-    DEAUTH = "deauth"
+    DEAUTH = "deauth"                # broadcast: every client on the target's channel
+    DEAUTH_UNICAST = "deauth_unicast"  # one deauth per client (single-client targeting)
     CSA = "csa"
     BTM = "btm"
 
@@ -37,6 +38,9 @@ class Punter:
         frames: list[bytes] = []
         if PuntMode.DEAUTH in self.modes:
             frames.append(self._deauth)
+        if PuntMode.DEAUTH_UNICAST in self.modes:                # one deauth per client, no broadcast noise
+            frames += [build_deauth(c, self._target_bssid, self._target_bssid, _DEAUTH_REASON)
+                      for c in clients]
         if PuntMode.CSA in self.modes:
             frames.append(self._csa)
         if PuntMode.BTM in self.modes:                          # unicast: one steer per client

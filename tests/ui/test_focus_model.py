@@ -383,11 +383,13 @@ def test_deauth_blocked_by_mutex_or_pmf():
 
 
 def test_buttons_open_hides_pmkid():
-    """THE FIX: an open network has no PSK AKM → no PMKID button (was shown)."""
+    """THE FIX: an open network has no PSK AKM → no PMKID button (was shown). EvilTwin stays
+    visible: an open twin (no downgrade, no 4-way) is a legitimate clone target too."""
     b = fm.derive_buttons(_rsn_ap(encryption="OPEN", akms=()))
     assert b["btn-pmkid"].visible is False
     assert all(not b[bid].visible for bid in
-               ("btn-gen-ivs", "btn-chop", "btn-deauth", "btn-wps-pin", "btn-eviltwin"))
+               ("btn-gen-ivs", "btn-chop", "btn-deauth", "btn-wps-pin"))
+    assert b["btn-eviltwin"].visible is True
 
 
 def test_buttons_unconfirmed_encryption_shows_pmkid_disabled_with_reason():
@@ -426,7 +428,7 @@ def test_buttons_eviltwin_enabled_single_card():
 
 def test_headline_eviltwin_active_and_captured():
     stats = types.SimpleNamespace(auth=2, assoc=1, m2=0, probes_direct=3, probes_wildcard=5)
-    camp = types.SimpleNamespace(captured=False, twin_channel=1,
+    camp = types.SimpleNamespace(captured=False, client_joined=False, twin_channel=1,
                                  fakeap=types.SimpleNamespace(stats=stats))
     campaigns = fm.Campaigns(eviltwin=camp)
     active = fm.derive_headline(_rsn_ap(), None, campaigns)
@@ -435,6 +437,39 @@ def test_headline_eviltwin_active_and_captured():
     assert "3 direct" in active[2] and "5 wildcard" in active[2]
     camp.captured = True
     assert "Captured" in fm.derive_headline(_rsn_ap(), None, campaigns)[0]
+
+
+def test_headline_eviltwin_open_client_joined_keeps_running():
+    """An open twin never auto-stops on a join; the headline just says so and keeps showing it,
+    letting the operator judge when to stop it themselves."""
+    camp = types.SimpleNamespace(captured=False, client_joined=True, twin_channel=6,
+                                 fakeap=types.SimpleNamespace(stats=types.SimpleNamespace(
+                                     auth=1, assoc=1, m2=0, probes_direct=0, probes_wildcard=1)))
+    campaigns = fm.Campaigns(eviltwin=camp)
+    active = fm.derive_headline(_rsn_ap(), None, campaigns)
+    assert "Client joined" in active[0] and "CH 6" in active[1]
+
+
+def test_headline_eviltwin_shows_internet_shared_when_nat_is_up():
+    portal = types.SimpleNamespace(internet_shared=True, nat_error=None)
+    camp = types.SimpleNamespace(captured=False, client_joined=True, twin_channel=6, portal=portal,
+                                 fakeap=types.SimpleNamespace(stats=types.SimpleNamespace(
+                                     auth=1, assoc=1, m2=0, probes_direct=0, probes_wildcard=1)))
+    campaigns = fm.Campaigns(eviltwin=camp)
+    active = fm.derive_headline(_rsn_ap(), None, campaigns)
+    assert any("internet: shared" in line for line in active)
+
+
+def test_headline_eviltwin_shows_nat_error_when_no_uplink():
+    portal = types.SimpleNamespace(internet_shared=False,
+                                   nat_error="no internet-connected interface found to share")
+    camp = types.SimpleNamespace(captured=False, client_joined=False, twin_channel=6, portal=portal,
+                                 ip_layer_error=None,
+                                 fakeap=types.SimpleNamespace(stats=types.SimpleNamespace(
+                                     auth=1, assoc=1, m2=0, probes_direct=0, probes_wildcard=1)))
+    campaigns = fm.Campaigns(eviltwin=camp)
+    active = fm.derive_headline(_rsn_ap(), None, campaigns)
+    assert any("no internet" in line for line in active)
 
 
 def test_derive_buttons_all_disabled_when_silenced(monkeypatch):

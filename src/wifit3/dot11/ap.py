@@ -10,7 +10,8 @@ from typing import Optional
 from wifit3.dot11.ie import rates_ie, ext_rates_ie, ds_param_ie, force_psk_akm, GENERIC_RSN_IE
 from wifit3.dot11.eapol import data_header, eapol_key, LLC_SNAP_EAPOL
 
-_CAP_ESS_PRIVACY = 0x0011
+_CAP_ESS = 0x0001
+_CAP_PRIVACY = 0x0010
 _BEACON_HEAD = 36               # 24B MAC header + 12B fixed (timestamp, interval, capability)
 _ELEMID_DS = 0x03
 _ELEMID_RSN = 0x30
@@ -30,9 +31,11 @@ def auth_resp(bssid: bytes, client: bytes) -> bytes:
     return _resp_header(b"\xb0\x00", bssid, client) + b"\x00\x00\x02\x00\x00\x00"
 
 
-def assoc_resp(bssid: bytes, client: bytes, aid: int = 1) -> bytes:
-    """Association Response: ESS+Privacy capability, status 0 (success), AID, rate menus."""
-    body = (struct.pack("<H", _CAP_ESS_PRIVACY) + b"\x00\x00" + struct.pack("<H", aid)
+def assoc_resp(bssid: bytes, client: bytes, aid: int = 1, secured: bool = True) -> bytes:
+    """Association Response: ESS (+Privacy when ``secured``) capability, status 0 (success), AID,
+    rate menus."""
+    cap = _CAP_ESS | (_CAP_PRIVACY if secured else 0)
+    body = (struct.pack("<H", cap) + b"\x00\x00" + struct.pack("<H", aid)
             + rates_ie() + ext_rates_ie())
     return _resp_header(b"\x10\x00", bssid, client) + body
 

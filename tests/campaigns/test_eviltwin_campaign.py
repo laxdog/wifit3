@@ -8,6 +8,7 @@ from types import SimpleNamespace
 from wifit3.campaigns.campaign import Campaign
 from wifit3.campaigns.eviltwin import (
     EvilTwinCampaign, EvilTwinInput, PuntMode, default_punt_modes, csa_target_channel,
+    ClientPhase, ClientProgress,
 )
 from wifit3.dot11.ap import eapol_m1
 from wifit3.dot11.eapol import eapol_key, data_header, LLC_SNAP_EAPOL
@@ -83,7 +84,12 @@ class _FakeArray:
 
 def _target():
     return SimpleNamespace(bssid=_BSSID, ssid=_SSID, channel=11,
-                           last_beacon_frame=_BEACON, akm_suites=[2])
+                           last_beacon_frame=_BEACON, akm_suites=[2], encryption="WPA2")
+
+
+def _open_target():
+    return SimpleNamespace(bssid=_BSSID, ssid=_SSID, channel=11,
+                           last_beacon_frame=_BEACON, akm_suites=[], encryption="OPEN")
 
 
 def _input(twin, punt, modes=(PuntMode.DEAUTH, PuntMode.CSA), period=0.5, bssid=_BSSID):
@@ -116,8 +122,9 @@ def _client_m2(snonce: bytes) -> bytes:
 
 def test_visible_and_ineligible():
     assert EvilTwinCampaign.visible(_target())
+    assert EvilTwinCampaign.visible(_open_target())        # open networks are cloneable too
     assert EvilTwinCampaign.visible(SimpleNamespace(ssid=None, akm_suites=[2])) is False
-    assert EvilTwinCampaign.visible(SimpleNamespace(ssid="x", akm_suites=[])) is False
+    assert EvilTwinCampaign.visible(SimpleNamespace(ssid="x", akm_suites=[], encryption="WEP")) is False
     no_beacon = SimpleNamespace(bssid=_BSSID, ssid=_SSID, channel=11,
                                 last_beacon_frame=None, akm_suites=[2])
     assert EvilTwinCampaign.ineligible_reason(no_beacon) == "no beacon captured yet"
@@ -214,6 +221,105 @@ def test_record_injected_m1_pairs_with_real_m2():
     hs = ap.handshakes[_CLIENT]
     assert {m.msg_num for m in hs.messages} == {1, 2}
     assert crackable_pairs(hs)
+
+
+async def test_open_target_never_auto_stops_on_client_association():
+    """A joined client must stay associated to be worth anything: an open twin keeps running
+    (and beaconing/responding) through an association, only ``client_joined`` flips. Only a
+    manual stop (self.stopped = True) ends it, same as the host-only/passive path."""
+    array, twin, punt = _FakeArray(), _FakeIface(), _FakeIface(11)
+    camp = EvilTwinCampaign(array, _open_target(),
+                            _input(twin, punt, modes=(PuntMode.DEAUTH,), period=0.05))
+    assert camp.secured is False
+    task = asyncio.create_task(camp._loop())
+    await asyncio.sleep(0.05)
+    assert not task.done() and camp.client_joined is False
+
+    camp.fakeap.stats.clients[_CLIENT] = ClientProgress(phase=ClientPhase.ASSOCED)
+    for _ in range(200):                              # pump ticks (this module collapses sleeps)
+        if camp.client_joined:
+            break
+        await asyncio.sleep(0.01)
+    assert not task.done()                            # still running: the client is still on it
+    assert camp.client_joined is True and not camp.captured
+
+    camp.stopped = True
+    await asyncio.wait_for(task, timeout=1.0)
+    await camp.teardown()
+    assert not camp.captured                          # ended by the user, not by "capture"
+
+
+def test_open_target_fakeap_is_unsecured():
+    array, twin, punt = _FakeArray(), _FakeIface(), _FakeIface(11)
+    camp = EvilTwinCampaign(array, _open_target(), _input(twin, punt, modes=()))
+    assert camp.secured is False
+
+
+async def test_ip_layer_off_by_default_even_for_open_target():
+    """``EvilTwinInput.ip_layer`` defaults False: constructing a campaign never touches a real
+    TAP device unless the caller (the modal, for an open target) explicitly opts in."""
+    array, twin, punt = _FakeArray(), _FakeIface(), _FakeIface(11)
+    camp = EvilTwinCampaign(array, _open_target(), _input(twin, punt, modes=(), period=0.05))
+    task = asyncio.create_task(camp._loop())
+    await asyncio.sleep(0.05)
+    camp.stopped = True
+    await task
+    await camp.teardown()
+    assert camp.portal is None and camp.ip_layer_error is None
+
+
+async def test_ip_layer_starts_when_enabled_and_stops_on_teardown(mocker):
+    array, twin, punt = _FakeArray(), _FakeIface(), _FakeIface(11)
+    stack = mocker.MagicMock(start=mocker.AsyncMock(), stop=mocker.AsyncMock())
+    mocker.patch("wifit3.campaigns.eviltwin.campaign.PortalStack", return_value=stack)
+    inp = EvilTwinInput(twin_iface=twin, punt_iface=punt, twin_channel=1, twin_bssid=_BSSID,
+                        punt_modes=(), punt_period_sec=0.05, ip_layer=True)
+    camp = EvilTwinCampaign(array, _open_target(), inp)
+    task = asyncio.create_task(camp._loop())
+    await asyncio.sleep(0.05)
+    assert camp.portal is stack and camp.ip_layer_error is None
+    stack.start.assert_awaited_once()
+    camp.stopped = True
+    await task
+    await camp.teardown()
+    stack.stop.assert_awaited_once()
+
+
+async def test_ip_layer_failure_degrades_gracefully(mocker):
+    """A TAP/DHCP bring-up failure (no CAP_NET_ADMIN, no /dev/net/tun, ...) must not crash the
+    campaign: the twin keeps running association-only, same as ``ip_layer=False``."""
+    array, twin, punt = _FakeArray(), _FakeIface(), _FakeIface(11)
+    failing = mocker.MagicMock(start=mocker.AsyncMock(side_effect=RuntimeError("no tun")))
+    mocker.patch("wifit3.campaigns.eviltwin.campaign.PortalStack", return_value=failing)
+    inp = EvilTwinInput(twin_iface=twin, punt_iface=punt, twin_channel=1, twin_bssid=_BSSID,
+                        punt_modes=(), punt_period_sec=0.05, ip_layer=True)
+    camp = EvilTwinCampaign(array, _open_target(), inp)
+    task = asyncio.create_task(camp._loop())
+    await asyncio.sleep(0.05)
+    assert camp.portal is None and camp.ip_layer_error == "no tun"
+    assert not task.done()                            # still running despite the IP-layer failure
+    camp.stopped = True
+    await task
+    await camp.teardown()
+
+
+async def test_target_client_restricts_punt_and_fakeap():
+    array, twin, punt = _FakeArray(), _FakeIface(), _FakeIface(11)
+    array.clients[_CLIENT] = SimpleNamespace(mac=_CLIENT, bssid=_BSSID)
+    array.clients["02:00:00:00:00:99"] = SimpleNamespace(mac="02:00:00:00:00:99", bssid=_BSSID)
+    inp = EvilTwinInput(twin_iface=twin, punt_iface=punt, twin_channel=1, twin_bssid=_BSSID,
+                        punt_modes=(PuntMode.DEAUTH_UNICAST, PuntMode.BTM), punt_period_sec=0.05,
+                        target_client=_CLIENT)
+    array.access_points[_BSSID] = SimpleNamespace(handshakes={})
+    camp = EvilTwinCampaign(array, _target(), inp)
+    assert camp._target_clients() == [_CLIENT_B]      # only the chosen client, not both known ones
+    assert camp.fakeap is None
+    task = asyncio.create_task(camp._loop())
+    await asyncio.sleep(0.02)
+    camp.stopped = True
+    await task
+    await camp.teardown()
+    assert camp.fakeap.target_client == _CLIENT_B
 
 
 async def test_run_drives_loop_and_restores_channel():

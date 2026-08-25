@@ -34,6 +34,11 @@ def test_assoc_resp_success_with_privacy_and_rates():
     assert rates_ie() in f
 
 
+def test_assoc_resp_open_twin_clears_privacy():
+    f = assoc_resp(_BSSID, _CLIENT, aid=1, secured=False)
+    assert f[24:26] == b"\x01\x00"                    # ESS only: no Privacy bit to prompt a password
+
+
 def test_eapol_m1_layout_fromds_no_mic():
     f = eapol_m1(_BSSID, _CLIENT, _ANONCE, replay=1)
     assert f[0:2] == b"\x08\x02"                      # Data, FromDS

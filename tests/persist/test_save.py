@@ -5,6 +5,7 @@ from wifit3.models import AccessPoint, HandshakeMessage, Handshake
 from wifit3.persist.save import (
     save_handshake,
     save_pmkid,
+    save_portal_credentials,
     save_wep_key,
     save_wps_pbc,
     save_wps_pin,
@@ -282,6 +283,39 @@ class TestSaveWpsPbc:
         save_wps_pbc(ap, "psk1", captures_dir=tmp_path)
         second = save_wps_pbc(ap, "psk2", captures_dir=tmp_path)
         assert second is not None and second.was_new is True
+
+
+class TestSavePortalCredentials:
+    def test_writes_submitted_fields(self, tmp_path):
+        ap = AccessPoint(bssid="aa:bb:cc:dd:ee:ff", ssid="HomeNet")
+        result = save_portal_credentials(ap, {"password": "hunter2"}, captures_dir=tmp_path)
+        assert result is not None and result.was_new is True
+        assert result.path.name.endswith("_portal.txt")
+        body = result.path.read_text(encoding="utf-8")
+        assert "password: hunter2" in body and "SSID: HomeNet" in body
+
+    def test_empty_fields_returns_none(self, tmp_path):
+        ap = AccessPoint(bssid="aa:bb:cc:dd:ee:ff", ssid="HomeNet")
+        assert save_portal_credentials(ap, {}, captures_dir=tmp_path) is None
+
+    def test_dedupes_identical_submission(self, tmp_path):
+        ap = AccessPoint(bssid="aa:bb:cc:dd:ee:ff", ssid="HomeNet")
+        first = save_portal_credentials(ap, {"password": "hunter2"}, captures_dir=tmp_path)
+        again = save_portal_credentials(ap, {"password": "hunter2"}, captures_dir=tmp_path)
+        assert again is not None and again.was_new is False and again.path == first.path
+
+    def test_different_submission_writes_new(self, tmp_path):
+        ap = AccessPoint(bssid="aa:bb:cc:dd:ee:ff", ssid="HomeNet")
+        save_portal_credentials(ap, {"password": "wrong-guess"}, captures_dir=tmp_path)
+        second = save_portal_credentials(ap, {"password": "hunter2"}, captures_dir=tmp_path)
+        assert second is not None and second.was_new is True
+
+    def test_multiple_fields_all_written(self, tmp_path):
+        ap = AccessPoint(bssid="aa:bb:cc:dd:ee:ff", ssid="HomeNet")
+        result = save_portal_credentials(
+            ap, {"email": "a@b.com", "password": "x"}, captures_dir=tmp_path)
+        body = result.path.read_text(encoding="utf-8")
+        assert "email: a@b.com" in body and "password: x" in body
 
 
 # ---- SSID sanitization (path traversal) ------------------------------------

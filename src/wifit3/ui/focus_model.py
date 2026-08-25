@@ -390,13 +390,29 @@ def derive_headline(ap, array, campaigns: Campaigns) -> list[str]:
         if camp.captured:
             return ["[black bold on green] ✓ Captured [/black bold on green] crackable M2",
                     "[dim]saved to captures/[/dim]"]
+        portal = getattr(camp, "portal", None)
+        internet = getattr(portal, "internet_shared", False)
+        if camp.client_joined:
+            lines = ["[black bold on green] ✓ Client joined [/black bold on green] the open twin",
+                    f"[dim]CH {camp.twin_channel} · stop when done[/dim]"]
+            if internet:
+                lines.append("[dim]internet: shared[/dim]")
+            return lines
         stats = getattr(camp.fakeap, "stats", None)
         if stats is None:
             return [f"[bold cyan]EvilTwin arming…[/bold cyan] on CH {camp.twin_channel}"]
-        return [f"[bold cyan]EvilTwin active[/bold cyan] on CH {camp.twin_channel}",
+        lines = [f"[bold cyan]EvilTwin active[/bold cyan] on CH {camp.twin_channel}",
                 f"[dim]auth:{stats.auth} · assoc:{stats.assoc} · M2:{stats.m2}[/dim]",
                 f"[dim]probes: {stats.probes_direct} direct · "
                 f"{stats.probes_wildcard} wildcard[/dim]"]
+        if internet:
+            lines.append("[dim]internet: shared[/dim]")
+        if getattr(camp, "ip_layer_error", None):
+            lines.append(f"[dark_orange]no IP layer: {escape(camp.ip_layer_error)}[/dark_orange]")
+        nat_error = getattr(portal, "nat_error", None)
+        if nat_error:
+            lines.append(f"[dim]no internet: {escape(nat_error)}[/dim]")
+        return lines
 
     # 3b. Deauth campaign running: provoking a re-handshake for the passive capture.
     deauth = campaigns.deauth

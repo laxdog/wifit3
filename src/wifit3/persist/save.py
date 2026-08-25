@@ -260,3 +260,30 @@ def save_wps_pbc(
     )
     path.write_text(body, encoding="utf-8")
     return SaveResult(path=path, was_new=True)
+
+
+# ----- EvilTwin captive-portal submission -----------------------------------
+
+def save_portal_credentials(
+    ap: AccessPoint, fields: dict,
+    *, captures_dir: Path = Path("captures"),
+) -> Optional[SaveResult]:
+    """Persist one harvested captive-portal form submission. Dedupes by exact field content for
+    this BSSID; a different retry (e.g. mistyped then corrected) still gets its own file."""
+    if not fields:
+        return None
+    body = f"SSID: {ap.ssid or ''}\nBSSID: {ap.bssid}\n" + "".join(
+        f"{k}: {v}\n" for k, v in fields.items())
+    for p in _existing(captures_dir, ap.bssid, "_portal.txt"):
+        try:
+            text = p.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        if text == body:
+            return SaveResult(path=p, was_new=False)
+
+    captures_dir = Path(captures_dir)
+    captures_dir.mkdir(parents=True, exist_ok=True)
+    path = _fresh_path(captures_dir, ap, "_portal.txt")
+    path.write_text(body, encoding="utf-8")
+    return SaveResult(path=path, was_new=True)
