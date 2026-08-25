@@ -39,31 +39,42 @@ async def _connect(port):
 
 async def test_request_parses_200_with_content_length(loopback_server):
     reader, writer = await _connect(loopback_server)
-    status, headers, body = await phc._request(reader, writer, "x", 80, "/", 3)
+    status, headers, body = await phc._request(reader, writer, "x", 80, "http", "/", 3)
     assert status == 200 and body == _PORTAL_HTML.encode()
 
 
 async def test_request_parses_redirect_with_location(loopback_server):
     reader, writer = await _connect(loopback_server)
-    status, headers, body = await phc._request(reader, writer, "x", 80, "/redirect-me", 3)
+    status, headers, body = await phc._request(reader, writer, "x", 80, "http", "/redirect-me", 3)
     assert status == 302 and headers["location"] == "/"
 
 
 async def test_request_falls_back_to_read_until_close_with_no_content_length(loopback_server):
     reader, writer = await _connect(loopback_server)
-    status, headers, body = await phc._request(reader, writer, "x", 80, "/no-content-length", 3)
+    status, headers, body = await phc._request(reader, writer, "x", 80, "http",
+                                                "/no-content-length", 3)
     assert status == 200 and body == _PORTAL_HTML.encode()
 
 
-async def test_request_sends_the_port_in_the_host_header_when_non_80(loopback_server):
+async def test_request_sends_the_port_in_the_host_header_when_non_default(loopback_server):
     """HTTP/1.1 requires Host: to carry the port when it's not the default -- nodogsplash's own
     redirect-vs-serve routing (GatewayPort 2050) depends on seeing it."""
     reader, writer = await _connect(loopback_server)
     sent = []
     real_write = writer.write
     writer.write = lambda data: (sent.append(data), real_write(data))[1]
-    await phc._request(reader, writer, "192.168.9.1", 2050, "/splash.html", 3)
+    await phc._request(reader, writer, "192.168.9.1", 2050, "http", "/splash.html", 3)
     assert b"Host: 192.168.9.1:2050\r\n" in sent[0]
+
+
+async def test_request_omits_the_port_for_https_on_443(loopback_server):
+    """443 is https's own default port -- omit it just like :80 is omitted for http."""
+    reader, writer = await _connect(loopback_server)
+    sent = []
+    real_write = writer.write
+    writer.write = lambda data: (sent.append(data), real_write(data))[1]
+    await phc._request(reader, writer, "example.com", 443, "https", "/", 3)
+    assert b"Host: example.com\r\n" in sent[0]
 
 
 async def test_request_returns_none_status_on_garbage_response():
@@ -81,7 +92,7 @@ async def test_request_returns_none_status_on_garbage_response():
         def close(self):
             pass
 
-    status, headers, body = await phc._request(_Reader(), _Writer(), "x", 80, "/", 3)
+    status, headers, body = await phc._request(_Reader(), _Writer(), "x", 80, "http", "/", 3)
     assert status is None and body is None
 
 
@@ -96,7 +107,7 @@ async def test_fetch_returns_body_on_direct_200(mocker):
 async def test_fetch_follows_one_redirect_then_returns_body(mocker):
     calls = []
 
-    async def fake_get(tap_name, host, port, path, timeout, *, dns_ip=None):
+    async def fake_get(tap_name, host, port, scheme, path, timeout, *, dns_ip=None):
         calls.append((host, port, path))
         if len(calls) == 1:
             return 302, {"location": "/login.html"}, None
@@ -115,20 +126,37 @@ async def test_fetch_gives_up_after_too_many_redirects(mocker):
     assert result is None
 
 
-async def test_fetch_does_not_chase_an_https_redirect(mocker):
+async def test_fetch_chases_an_https_redirect(mocker):
+    """A carrier "community WiFi" AP's real login page is HTTPS-only (confirmed live) --
+    refusing to follow it entirely meant the fetch could never see the actual page at all."""
+    calls = []
+
+    async def fake_get(tap_name, host, port, scheme, path, timeout, *, dns_ip=None):
+        calls.append((host, port, scheme, path))
+        if len(calls) == 1:
+            return 302, {"location": "https://example.com/login"}, None
+        return 200, {}, _PORTAL_HTML.encode()
+
+    mocker.patch.object(phc, "_get", fake_get)
+    result = await phc.fetch_portal_page("wifit3fetch0", "10.0.0.1")
+    assert result == _PORTAL_HTML
+    assert calls[1] == ("example.com", 443, "https", "/login")
+
+
+async def test_fetch_does_not_chase_a_non_http_scheme_redirect(mocker):
     mocker.patch.object(phc, "_get", mocker.AsyncMock(
-        return_value=(302, {"location": "https://example.com/login"}, None)))
+        return_value=(302, {"location": "ftp://example.com/login"}, None)))
     result = await phc.fetch_portal_page("wifit3fetch0", "10.0.0.1")
     assert result is None
 
 
-async def test_fetch_chases_a_same_scheme_redirect_to_a_non_80_port(mocker):
+async def test_fetch_chases_a_same_scheme_redirect_to_a_non_default_port(mocker):
     """nodogsplash's default GatewayPort is 2050: a plain-HTTP redirect to a non-80 port must
     still be followed, connecting to THAT port -- rejecting any non-80 port here (mistaking it
     for HTTPS) was a real bug that broke real nodogsplash portals."""
     calls = []
 
-    async def fake_get(tap_name, host, port, path, timeout, *, dns_ip=None):
+    async def fake_get(tap_name, host, port, scheme, path, timeout, *, dns_ip=None):
         calls.append((host, port, path))
         if len(calls) == 1:
             return 302, {"location": "http://10.0.0.1:2050/splash"}, None
@@ -140,11 +168,12 @@ async def test_fetch_chases_a_same_scheme_redirect_to_a_non_80_port(mocker):
     assert calls[1] == ("10.0.0.1", 2050, "/splash")
 
 
-async def test_fetch_chases_a_schemeless_redirect_to_a_non_80_port(mocker):
-    """A protocol-relative Location (e.g. "//10.0.0.1:2050/splash", no scheme) is still HTTP."""
+async def test_fetch_chases_a_schemeless_redirect_to_a_non_default_port(mocker):
+    """A protocol-relative Location (e.g. "//10.0.0.1:2050/splash", no scheme) inherits
+    whatever scheme the current hop is already using."""
     calls = []
 
-    async def fake_get(tap_name, host, port, path, timeout, *, dns_ip=None):
+    async def fake_get(tap_name, host, port, scheme, path, timeout, *, dns_ip=None):
         calls.append((host, port, path))
         if len(calls) == 1:
             return 302, {"location": "//10.0.0.1:2050/splash"}, None
@@ -170,7 +199,7 @@ async def test_fetch_starts_from_a_custom_path(mocker):
     """The probe-host fallback needs a non-``/`` starting path (e.g. hotspot-detect.html)."""
     get = mocker.patch.object(phc, "_get", mocker.AsyncMock(return_value=(200, {}, _PORTAL_HTML.encode())))
     await phc.fetch_portal_page("wifit3fetch0", "10.0.0.1", path="/hotspot-detect.html")
-    assert get.call_args.args[3] == "/hotspot-detect.html"
+    assert get.call_args.args[4] == "/hotspot-detect.html"
 
 
 # ----- fetch_page_with_assets: same-page <img>/<link>/<script> refs fetched too, from wherever
@@ -180,7 +209,7 @@ async def test_fetch_with_assets_fetches_referenced_css_from_the_pages_own_host_
     page_html = '<html><link rel="stylesheet" href="/splash.css"></html>'
     calls = []
 
-    async def fake_get(tap_name, host, port, path, timeout, *, dns_ip=None):
+    async def fake_get(tap_name, host, port, scheme, path, timeout, *, dns_ip=None):
         calls.append((host, port, path))
         if path == "/":
             # the login page itself redirects off to the real GatewayPort, same as nodogsplash/openNDS
@@ -201,10 +230,10 @@ async def test_fetch_with_assets_skips_a_ref_that_fails_to_fetch(mocker):
     mocker.patch.object(phc, "_get", mocker.AsyncMock(return_value=(200, {}, page_html.encode())))
     async_get = phc._get
 
-    async def fake_get(tap_name, host, port, path, timeout, *, dns_ip=None):
+    async def fake_get(tap_name, host, port, scheme, path, timeout, *, dns_ip=None):
         if path == "/missing.jpg":
             return 404, {}, b"nope"
-        return await async_get(tap_name, host, port, path, timeout, dns_ip=dns_ip)
+        return await async_get(tap_name, host, port, scheme, path, timeout, dns_ip=dns_ip)
 
     mocker.patch.object(phc, "_get", fake_get)
     page, assets = await phc.fetch_page_with_assets("wifit3fetch0", "10.0.0.1")
@@ -232,7 +261,7 @@ async def test_get_resolves_a_hostname_target_via_the_supplied_dns_ip(mocker):
             raise OSError("stop here: connect behavior isn't under test")
 
     mocker.patch("asyncio.get_running_loop", return_value=_FakeLoop())
-    status, headers, body = await phc._get("wifit3fetch0", "guest.example.com", 80, "/", 3,
+    status, headers, body = await phc._get("wifit3fetch0", "guest.example.com", 80, "http", "/", 3,
                                            dns_ip="10.0.0.1")
     assert status is None
     resolve.assert_awaited_once_with("wifit3fetch0", "10.0.0.1", "guest.example.com", timeout=3)
@@ -240,7 +269,7 @@ async def test_get_resolves_a_hostname_target_via_the_supplied_dns_ip(mocker):
 
 
 async def test_get_gives_up_immediately_when_hostname_and_no_dns_ip():
-    status, headers, body = await phc._get("wifit3fetch0", "guest.example.com", 80, "/", 3)
+    status, headers, body = await phc._get("wifit3fetch0", "guest.example.com", 80, "http", "/", 3)
     assert status is None and headers == {} and body is None
 
 
@@ -253,8 +282,46 @@ async def test_get_skips_resolution_for_a_bare_ip(mocker):
             raise OSError("stop here: connect behavior isn't under test")
 
     mocker.patch("asyncio.get_running_loop", return_value=_FakeLoop())
-    await phc._get("wifit3fetch0", "10.0.0.1", 80, "/", 3, dns_ip="10.0.0.1")
+    await phc._get("wifit3fetch0", "10.0.0.1", 80, "http", "/", 3, dns_ip="10.0.0.1")
     resolve.assert_not_called()
+
+
+# ----- HTTPS: real TLS wrapping, over the same TAP-scoped raw connect -------------------------
+
+async def test_get_wraps_the_socket_in_tls_when_scheme_is_https(mocker):
+    """Only the connect + SO_BINDTODEVICE is ours; the actual TLS handshake is asyncio/ssl's,
+    so this just confirms we ask for it -- with SNI/verification against the real hostname,
+    never the resolved IP, which wouldn't match the certificate's name."""
+    mocker.patch.object(phc, "resolve_dns", mocker.AsyncMock(return_value="93.184.216.34"))
+    mocker.patch.object(phc.socket, "socket", return_value=mocker.MagicMock())
+
+    class _FakeLoop:
+        async def sock_connect(self, sock, addr):
+            return None
+
+    mocker.patch("asyncio.get_running_loop", return_value=_FakeLoop())
+    open_connection = mocker.patch(
+        "asyncio.open_connection",
+        mocker.AsyncMock(side_effect=OSError("stop here: request behavior isn't under test")))
+    await phc._get("wifit3fetch0", "example.com", 443, "https", "/", 3, dns_ip="10.0.0.1")
+    assert open_connection.call_args.kwargs["ssl"] is phc._TLS_CONTEXT
+    assert open_connection.call_args.kwargs["server_hostname"] == "example.com"
+
+
+async def test_get_returns_none_on_a_failed_tls_handshake(mocker):
+    mocker.patch.object(phc, "resolve_dns", mocker.AsyncMock(return_value="93.184.216.34"))
+    mocker.patch.object(phc.socket, "socket", return_value=mocker.MagicMock())
+
+    class _FakeLoop:
+        async def sock_connect(self, sock, addr):
+            return None
+
+    mocker.patch("asyncio.get_running_loop", return_value=_FakeLoop())
+    mocker.patch("asyncio.open_connection",
+                 mocker.AsyncMock(side_effect=phc.ssl.SSLError("cert verify failed")))
+    status, headers, body = await phc._get("wifit3fetch0", "example.com", 443, "https", "/", 3,
+                                           dns_ip="10.0.0.1")
+    assert status is None and headers == {} and body is None
 
 
 # ----- end-to-end against the real HttpPortalServer, serving a real template -------------------
@@ -269,7 +336,7 @@ async def test_request_retrieves_a_real_template_byte_for_byte(template):
     port = server.sockets[0].getsockname()[1]
     try:
         reader, writer = await asyncio.open_connection("127.0.0.1", port)
-        status, headers, body = await phc._request(reader, writer, "127.0.0.1", port, "/", 3)
+        status, headers, body = await phc._request(reader, writer, "127.0.0.1", port, "http", "/", 3)
         assert status == 200 and body == page.encode()
     finally:
         server.close()

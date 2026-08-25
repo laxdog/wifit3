@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import socket
+import ssl
 from typing import Dict, Optional, Tuple
 from urllib.parse import urlsplit
 
@@ -22,15 +23,19 @@ _READ_TIMEOUT = 8.0
 _MAX_BODY = 262144
 _MAX_REDIRECTS = 3
 _REQUEST_PATH = "/"
+_DEFAULT_PORTS = {"http": 80, "https": 443}
+# Real verification (chain + hostname): this is a one-shot fetch of a real site's content for
+# cloning, not a live victim's traffic -- there's no reason to blind ourselves to a bad cert.
+_TLS_CONTEXT = ssl.create_default_context()
 
 
 async def fetch_portal_page(tap_name: str, gateway_ip: str, *, dns_ip: Optional[str] = None,
                             path: str = _REQUEST_PATH,
                             timeout: float = _READ_TIMEOUT) -> Optional[str]:
-    """GET ``path`` as text, following same-port redirects. None on any failure -- always
+    """GET ``path`` as text, following redirects (http or https). None on any failure -- always
     best-effort, the caller falls back to a template."""
-    data, _host, _port = await _fetch_with_redirects(tap_name, gateway_ip, 80, path, timeout,
-                                                      dns_ip=dns_ip)
+    data, _host, _port, _scheme = await _fetch_with_redirects(tap_name, gateway_ip, 80, "http",
+                                                               path, timeout, dns_ip=dns_ip)
     return data.decode("utf-8", "replace") if data is not None else None
 
 
@@ -38,16 +43,16 @@ async def fetch_page_with_assets(tap_name: str, gateway_ip: str, *, dns_ip: Opti
                                  path: str = _REQUEST_PATH, timeout: float = _READ_TIMEOUT
                                  ) -> Tuple[Optional[str], Dict[str, Tuple[str, bytes]]]:
     """Like ``fetch_portal_page``, but also best-effort fetches the page's own local asset refs,
-    from wherever the page itself landed (its real GatewayPort), not port 80 (redirects always)."""
-    data, host, port = await _fetch_with_redirects(tap_name, gateway_ip, 80, path, timeout,
-                                                    dns_ip=dns_ip)
+    from wherever the page itself landed (its real GatewayPort/scheme), not port 80 (redirects)."""
+    data, host, port, scheme = await _fetch_with_redirects(tap_name, gateway_ip, 80, "http",
+                                                            path, timeout, dns_ip=dns_ip)
     if data is None:
         return None, {}
     page = data.decode("utf-8", "replace")
     assets: Dict[str, Tuple[str, bytes]] = {}
     for ref in extract_asset_refs(page):
-        asset_data, _h, _p = await _fetch_with_redirects(tap_name, host, port, ref, timeout,
-                                                          dns_ip=dns_ip)
+        asset_data, _h, _p, _s = await _fetch_with_redirects(tap_name, host, port, scheme, ref,
+                                                              timeout, dns_ip=dns_ip)
         if asset_data is not None:
             assets[ref] = (guess_content_type(ref), asset_data)
         else:
@@ -55,44 +60,47 @@ async def fetch_page_with_assets(tap_name: str, gateway_ip: str, *, dns_ip: Opti
     return page, assets
 
 
-async def _fetch_with_redirects(tap_name: str, host: str, port: int, path: str, timeout: float,
-                                *, dns_ip: Optional[str] = None
-                                ) -> Tuple[Optional[bytes], str, int]:
-    """GET-with-redirects loop; also returns the host/port the chain landed on, so a caller
+async def _fetch_with_redirects(tap_name: str, host: str, port: int, scheme: str, path: str,
+                                timeout: float, *, dns_ip: Optional[str] = None
+                                ) -> Tuple[Optional[bytes], str, int, str]:
+    """GET-with-redirects loop (following the target's own scheme changes, e.g. an http probe
+    redirected to an https login page); also returns where the chain landed, so a caller
     fetching more from the same server (page assets) can start there, not back at port 80."""
     for _ in range(_MAX_REDIRECTS):
-        status, headers, body = await _get(tap_name, host, port, path, timeout, dns_ip=dns_ip)
+        status, headers, body = await _get(tap_name, host, port, scheme, path, timeout, dns_ip=dns_ip)
         if status is None:
-            logger.info("portal_http_client: %s:%d%s: no response (connect/request failed)",
-                       host, port, path)
-            return None, host, port
+            logger.info("portal_http_client: %s://%s:%d%s: no response (connect/request failed)",
+                       scheme, host, port, path)
+            return None, host, port, scheme
         if status in (301, 302, 303, 307, 308) and "location" in headers:
             nxt = urlsplit(headers["location"])
-            if nxt.scheme not in ("", "http"):   # https: can't intercept it, not chasing it
-                logger.info("portal_http_client: %s:%d%s -> %d redirect to %s (https, not "
-                           "chasing it)", host, port, path, status, headers["location"])
-                return None, host, port
-            logger.info("portal_http_client: %s:%d%s -> %d redirect to %s",
-                       host, port, path, status, headers["location"])
+            if nxt.scheme not in ("", "http", "https"):
+                logger.info("portal_http_client: %s://%s:%d%s -> %d redirect to %s (not http(s), "
+                           "not chasing it)", scheme, host, port, path, status, headers["location"])
+                return None, host, port, scheme
+            logger.info("portal_http_client: %s://%s:%d%s -> %d redirect to %s",
+                       scheme, host, port, path, status, headers["location"])
             host = nxt.hostname or host
-            # A splash server commonly redirects to its own non-80 listening port (nodogsplash's
-            # default GatewayPort is 2050) -- any port is fine as long as it's still plain HTTP;
-            # rejecting non-80 here was the actual bug behind "gateway ... failed" against a real
-            # nodogsplash portal, not an HTTPS-only one as the guessed status message assumed.
-            port = nxt.port or 80
+            scheme = nxt.scheme or scheme                # protocol-relative //host/path: inherit
+            # A splash server commonly redirects to its own non-default listening port
+            # (nodogsplash's GatewayPort 2050, a carrier community-WiFi login over 443) --
+            # any port is fine as long as we can still speak the scheme; rejecting non-80
+            # here at all was the actual bug behind "gateway ... failed" against nodogsplash.
+            port = nxt.port or _DEFAULT_PORTS[scheme]
             path = (nxt.path or "/") + (f"?{nxt.query}" if nxt.query else "")
             continue
         if status == 200 and body:
-            logger.info("portal_http_client: %s:%d%s -> 200, %d bytes", host, port, path, len(body))
-            return body, host, port
-        logger.info("portal_http_client: %s:%d%s -> %d, body=%d bytes (not usable)",
-                   host, port, path, status, len(body or b""))
-        return None, host, port
+            logger.info("portal_http_client: %s://%s:%d%s -> 200, %d bytes",
+                       scheme, host, port, path, len(body))
+            return body, host, port, scheme
+        logger.info("portal_http_client: %s://%s:%d%s -> %d, body=%d bytes (not usable)",
+                   scheme, host, port, path, status, len(body or b""))
+        return None, host, port, scheme
     logger.info("portal_http_client: gave up after %d redirects", _MAX_REDIRECTS)
-    return None, host, port
+    return None, host, port, scheme
 
 
-async def _get(tap_name: str, host: str, port: int, path: str, timeout: float, *,
+async def _get(tap_name: str, host: str, port: int, scheme: str, path: str, timeout: float, *,
                dns_ip: Optional[str] = None) -> Tuple[Optional[int], dict, Optional[bytes]]:
     """Scoped connect (untested here, same as ``net/tap.py``'s subprocess calls: pure OS
     integration) + the actual request, which ``_request`` below does and IS unit-tested."""
@@ -115,8 +123,19 @@ async def _get(tap_name: str, host: str, port: int, path: str, timeout: float, *
         logger.info("portal_http_client: connect to %s:%d failed: %s", connect_ip, port, exc)
         sock.close()
         return None, {}, None
-    reader, writer = await asyncio.open_connection(sock=sock)
-    return await _request(reader, writer, host, port, path, timeout)
+    try:
+        if scheme == "https":
+            # server_hostname is the ORIGINAL hostname (for SNI + cert verification), never
+            # connect_ip -- a bare IP wouldn't match the cert's name even if it resolved fine.
+            reader, writer = await asyncio.open_connection(
+                sock=sock, ssl=_TLS_CONTEXT, server_hostname=host)
+        else:
+            reader, writer = await asyncio.open_connection(sock=sock)
+    except (ssl.SSLError, OSError) as exc:
+        logger.info("portal_http_client: TLS handshake to %s:%d failed: %s", connect_ip, port, exc)
+        sock.close()
+        return None, {}, None
+    return await _request(reader, writer, host, port, scheme, path, timeout)
 
 
 def _is_ipv4(host: str) -> bool:
@@ -132,14 +151,16 @@ async def _resolve_host(tap_name: str, host: str, dns_ip: Optional[str],
 
 
 async def _request(reader: asyncio.StreamReader, writer: asyncio.StreamWriter, host: str,
-                   port: int, path: str, timeout: float) -> Tuple[Optional[int], dict, Optional[bytes]]:
+                   port: int, scheme: str, path: str, timeout: float
+                   ) -> Tuple[Optional[int], dict, Optional[bytes]]:
     try:
-        # A bare IP in Host: on a non-80 port is not what a real browser sends (HTTP/1.1 requires
-        # the port whenever it's non-default), and nodogsplash's redirect-vs-serve decision reads
-        # Host: to tell "this request is for my own splash server" apart from "still an
-        # unauthenticated client trying to reach somewhere else" -- omitting it here meant nodogsplash
-        # never recognized us on the GatewayPort hop, and kept re-wrapping+redirecting forever.
-        host_header = host if port == 80 else f"{host}:{port}"
+        # A bare IP in Host: on a non-default port is not what a real browser sends (HTTP/1.1
+        # requires the port whenever it's non-default for the scheme in use), and nodogsplash's
+        # redirect-vs-serve decision reads Host: to tell "this request is for my own splash
+        # server" apart from "still an unauthenticated client trying to reach somewhere else" --
+        # omitting it here meant nodogsplash never recognized us on the GatewayPort hop, and kept
+        # re-wrapping+redirecting forever.
+        host_header = host if port == _DEFAULT_PORTS[scheme] else f"{host}:{port}"
         writer.write((f"GET {path} HTTP/1.1\r\nHost: {host_header}\r\nUser-Agent: Mozilla/5.0\r\n"
                      f"Accept: text/html\r\nConnection: close\r\n\r\n").encode("ascii"))
         await writer.drain()
