@@ -85,7 +85,7 @@ async def _get(tap_name: str, host: str, port: int, path: str, timeout: float, *
         sock.close()
         return None, {}, None
     reader, writer = await asyncio.open_connection(sock=sock)
-    return await _request(reader, writer, host, path, timeout)
+    return await _request(reader, writer, host, port, path, timeout)
 
 
 def _is_ipv4(host: str) -> bool:
@@ -101,9 +101,15 @@ async def _resolve_host(tap_name: str, host: str, dns_ip: Optional[str],
 
 
 async def _request(reader: asyncio.StreamReader, writer: asyncio.StreamWriter, host: str,
-                   path: str, timeout: float) -> Tuple[Optional[int], dict, Optional[str]]:
+                   port: int, path: str, timeout: float) -> Tuple[Optional[int], dict, Optional[str]]:
     try:
-        writer.write((f"GET {path} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: Mozilla/5.0\r\n"
+        # A bare IP in Host: on a non-80 port is not what a real browser sends (HTTP/1.1 requires
+        # the port whenever it's non-default), and nodogsplash's redirect-vs-serve decision reads
+        # Host: to tell "this request is for my own splash server" apart from "still an
+        # unauthenticated client trying to reach somewhere else" -- omitting it here meant nodogsplash
+        # never recognized us on the GatewayPort hop, and kept re-wrapping+redirecting forever.
+        host_header = host if port == 80 else f"{host}:{port}"
+        writer.write((f"GET {path} HTTP/1.1\r\nHost: {host_header}\r\nUser-Agent: Mozilla/5.0\r\n"
                      f"Accept: text/html\r\nConnection: close\r\n\r\n").encode("ascii"))
         await writer.drain()
         status, headers = await _read_head(reader, timeout)

@@ -39,20 +39,31 @@ async def _connect(port):
 
 async def test_request_parses_200_with_content_length(loopback_server):
     reader, writer = await _connect(loopback_server)
-    status, headers, body = await phc._request(reader, writer, "x", "/", 3)
+    status, headers, body = await phc._request(reader, writer, "x", 80, "/", 3)
     assert status == 200 and body == _PORTAL_HTML
 
 
 async def test_request_parses_redirect_with_location(loopback_server):
     reader, writer = await _connect(loopback_server)
-    status, headers, body = await phc._request(reader, writer, "x", "/redirect-me", 3)
+    status, headers, body = await phc._request(reader, writer, "x", 80, "/redirect-me", 3)
     assert status == 302 and headers["location"] == "/"
 
 
 async def test_request_falls_back_to_read_until_close_with_no_content_length(loopback_server):
     reader, writer = await _connect(loopback_server)
-    status, headers, body = await phc._request(reader, writer, "x", "/no-content-length", 3)
+    status, headers, body = await phc._request(reader, writer, "x", 80, "/no-content-length", 3)
     assert status == 200 and body == _PORTAL_HTML
+
+
+async def test_request_sends_the_port_in_the_host_header_when_non_80(loopback_server):
+    """HTTP/1.1 requires Host: to carry the port when it's not the default -- nodogsplash's own
+    redirect-vs-serve routing (GatewayPort 2050) depends on seeing it."""
+    reader, writer = await _connect(loopback_server)
+    sent = []
+    real_write = writer.write
+    writer.write = lambda data: (sent.append(data), real_write(data))[1]
+    await phc._request(reader, writer, "192.168.9.1", 2050, "/splash.html", 3)
+    assert b"Host: 192.168.9.1:2050\r\n" in sent[0]
 
 
 async def test_request_returns_none_status_on_garbage_response():
@@ -70,7 +81,7 @@ async def test_request_returns_none_status_on_garbage_response():
         def close(self):
             pass
 
-    status, headers, body = await phc._request(_Reader(), _Writer(), "x", "/", 3)
+    status, headers, body = await phc._request(_Reader(), _Writer(), "x", 80, "/", 3)
     assert status is None and body is None
 
 
@@ -213,7 +224,7 @@ async def test_request_retrieves_a_real_template_byte_for_byte(template):
     port = server.sockets[0].getsockname()[1]
     try:
         reader, writer = await asyncio.open_connection("127.0.0.1", port)
-        status, headers, body = await phc._request(reader, writer, "127.0.0.1", "/", 3)
+        status, headers, body = await phc._request(reader, writer, "127.0.0.1", port, "/", 3)
         assert status == 200 and body == page
     finally:
         server.close()
