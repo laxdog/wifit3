@@ -90,7 +90,11 @@ async def _fetch(array, iface, bssid: str, ssid: str, channel: int) -> FetchResu
 
 async def _associate_and_fetch(iface, bssid_bytes: bytes, bssid: str, ssid: str, channel: int,
                                our_mac: bytes) -> FetchResult:
-    assoc = Association(iface, bssid, ssid, channel, our_mac=our_mac)
+    # This fetch only ever runs against a confirmed-open target (campaign.py's own
+    # _should_clone_real_portal gates on `not self.secured`) -- claiming Privacy here is what
+    # got a real carrier "community WiFi" AP to reject us outright (status 12); its own hostapd
+    # test target let the mismatch slide, which is why this went unnoticed until now.
+    assoc = Association(iface, bssid, ssid, channel, our_mac=our_mac, privacy=False)
     assoc.start()
     try:
         logger.info("eviltwin: real-portal fetch: associating to %s on ch %d", bssid, channel)

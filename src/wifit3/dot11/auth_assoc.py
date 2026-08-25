@@ -7,9 +7,11 @@ import struct
 
 from wifit3.dot11.ie import ssid_ie, rates_ie, ext_rates_ie
 
-# Assoc-request capability: ESS + Privacy. Distinct from the probe-response capability
-# (see dot11.probe._CAPABILITY_INFO). Do not conflate.
-_CAP_ESS_PRIVACY = 0x0011
+# Assoc-request capability bits: ESS always, Privacy only when the target actually uses one
+# (WEP/WPA/WPA2/WPA3 -- anything from Open System auth through a real handshake). Distinct from
+# the probe-response capability (see dot11.probe._CAPABILITY_INFO). Do not conflate.
+_CAP_ESS = 0x0001
+_CAP_PRIVACY = 0x0010
 
 
 def _hdr(fc: bytes, bssid: bytes, our_mac: bytes) -> bytes:
@@ -23,11 +25,11 @@ def auth_req(bssid: bytes, our_mac: bytes) -> bytes:
     return _hdr(b"\xb0\x00", bssid, our_mac) + b"\x00\x00\x01\x00\x00\x00"
 
 
-def assoc_req(bssid: bytes, our_mac: bytes, ssid: str, trailer_ies: bytes = b"") -> bytes:
-    """Association Request: ESS+Privacy capabilities, listen interval, SSID + rates, then
-    any ``trailer_ies`` the caller appends (a forced-PSK RSN IE for PMKID, a WPS vendor IE
-    for the WPS exchange, or nothing for plain/WEP association)."""
-    cap = struct.pack("<H", _CAP_ESS_PRIVACY)
+def assoc_req(bssid: bytes, our_mac: bytes, ssid: str, trailer_ies: bytes = b"",
+              privacy: bool = True) -> bytes:
+    """Association Request; ``trailer_ies``: forced-PSK RSN IE (PMKID) / WPS vendor IE / none.
+    ``privacy=False`` for a confirmed-open target -- some AP firmware rejects (status 12) a claim mismatching its actual capability; a lenient one let it slide (confirmed live, both ways)."""
+    cap = struct.pack("<H", _CAP_ESS | (_CAP_PRIVACY if privacy else 0))
     listen = struct.pack("<H", 0x0001)
     ies = ssid_ie(ssid) + rates_ie() + ext_rates_ie() + trailer_ies
     return _hdr(b"\x00\x00", bssid, our_mac) + cap + listen + ies

@@ -108,7 +108,8 @@ class Association:
                  our_mac: Optional[bytes] = None, assoc_timeout: float = 1.5,
                  auth_timeout: float = 1.0,
                  assoc_trailer_ies: bytes = b"",
-                 should_stop: Optional[Callable[[], bool]] = None):
+                 should_stop: Optional[Callable[[], bool]] = None,
+                 privacy: bool = True):
         self.iface = iface
         self.bssid = bssid.lower()
         self.bssid_bytes = str_to_mac(self.bssid)
@@ -119,6 +120,7 @@ class Association:
         self.auth_timeout = auth_timeout
         self.assoc_trailer_ies = assoc_trailer_ies
         self.should_stop = should_stop or (lambda: False)
+        self.privacy = privacy
         self.associated = False
         self.fail_reason: Optional[str] = None
         self._auth_ok = False
@@ -151,7 +153,7 @@ class Association:
                                    lambda: self._auth_ok, self.auth_timeout)
             # Send Assoc whether or not the Auth Resp surfaced
             await self._send_until(assoc_req(self.bssid_bytes, self.our_mac, self.ssid,
-                                             self.assoc_trailer_ies),
+                                             self.assoc_trailer_ies, privacy=self.privacy),
                                    lambda: self._assoc_ok, self.assoc_timeout)
             if self._assoc_ok:
                 self.associated = True

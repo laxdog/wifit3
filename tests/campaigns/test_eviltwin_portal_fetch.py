@@ -43,6 +43,15 @@ def _mock_association(mocker, ok: bool, fail_reason=None):
         associate=mocker.AsyncMock(return_value=ok), fail_reason=fail_reason))
 
 
+async def test_fetch_associates_without_claiming_privacy(mocker):
+    """The fetch only ever targets a confirmed-open AP (campaign.py gates on `not secured`):
+    claiming Privacy anyway got a real carrier AP to reject association outright (status 12)."""
+    iface = _FakeIface()
+    Association = _mock_association(mocker, ok=True)
+    await pf.fetch_real_portal(_FakeArray(iface), iface, _BSSID, "TestNet", 6)
+    assert Association.call_args.kwargs["privacy"] is False
+
+
 async def test_fetch_returns_none_when_association_fails(mocker):
     iface = _FakeIface()
     _mock_association(mocker, ok=False, fail_reason="no Assoc resp")
