@@ -714,11 +714,12 @@ class FocusViewV2(Screen):
                       "[yellow]disabled[/yellow] [dim](detect only, press w to toggle)[/dim]")
 
     def action_copy_log(self) -> None:
-        """'y': a terminal app can't offer native text selection, so put the whole log on the
+        """'y': a terminal app can't offer native text selection, so put the recent log on the
         system clipboard instead (OSC 52 -- works over SSH too, in terminals that support it)."""
         text = self.query_one("#log", LogBand).get_text()
         self.app.copy_to_clipboard(text)
-        self.notify("Log copied to clipboard", timeout=2)
+        n = text.count("\n") + 1 if text else 0
+        self.notify(f"Copied last {n} log line(s) to clipboard", timeout=2)
 
     def action_silence(self) -> None:
         self._toggle_silence()

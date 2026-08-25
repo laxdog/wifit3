@@ -8,6 +8,11 @@ from textual.app import ComposeResult
 from textual.containers import Vertical
 from textual.widgets import RichLog
 
+_COPY_MAX_LINES = 300   # OSC 52 (terminal clipboard) payloads get silently truncated/dropped by
+                        # many terminals past a few tens of KB, especially over SSH/tmux -- a
+                        # full session's log can run to thousands of lines, so copy only the most
+                        # recent ones (almost always what's wanted for debugging anyway).
+
 
 class LogBand(Vertical):
     def __init__(self, lines, **kwargs) -> None:
@@ -30,6 +35,7 @@ class LogBand(Vertical):
         self.query_one("#log-rich", RichLog).clear()
 
     def get_text(self) -> str:
-        """Every visible line, plain text (Rich markup/styling stripped): what 'copy the log'
-        should put on the clipboard, since a terminal app can't offer native text selection."""
-        return "\n".join(strip.text for strip in self.query_one("#log-rich", RichLog).lines)
+        """The last ``_COPY_MAX_LINES`` lines, plain text, right-trimmed (RichLog pads every
+        Strip to the widget's full render width, which would otherwise bloat the payload)."""
+        lines = self.query_one("#log-rich", RichLog).lines[-_COPY_MAX_LINES:]
+        return "\n".join(strip.text.rstrip() for strip in lines)
