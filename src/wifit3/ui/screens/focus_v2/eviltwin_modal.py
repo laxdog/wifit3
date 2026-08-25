@@ -23,7 +23,10 @@ _PORTAL_TEMPLATES = [("WiFi password", PortalTemplate.PASSWORD.value),
                      ("Phone number", PortalTemplate.PHONE.value),
                      ("Hotel room + last name", PortalTemplate.ROOM.value)]
 _CLONE_REAL_VALUE = "clone_real"   # sentinel Select value: not a PortalTemplate, a behavior flag
-_CLONE_REAL_LABEL = "Clone the real captive portal (2 cards, adds delay)"
+# The dropdown overlay renders at ~30 columns (dialog width 60, minus the row-label column and
+# borders): this option was previously 52 chars and got truncated to near-unrecognizability --
+# confirmed by inspecting SelectOverlay's rendered option text directly, not just guessed.
+_CLONE_REAL_LABEL = "Clone the real portal"
 _CLONE_REAL_FALLBACK = PortalTemplate.PASSWORD   # used only if the live fetch fails
 
 _MAC_RE = re.compile(r"^([0-9a-f]{2}:){5}[0-9a-f]{2}$")
@@ -284,7 +287,11 @@ class EvilTwinInputModal(ModalScreen[Optional[EvilTwinInput]]):
             self._set_warn("Pick a target client below")
             return
         same_iface = self._selected("twin-iface") is self._selected("punt-iface")
-        self._set_warn("EvilTwin works best with 2 different interfaces" if same_iface else "")
+        if same_iface:
+            self._set_warn("EvilTwin works best with 2 different interfaces")
+            return
+        cloning = self.query_one("#portal-template", Select).value == _CLONE_REAL_VALUE
+        self._set_warn("Cloning the real portal adds delay before the twin starts" if cloning else "")
 
     def _set_warn(self, text: str) -> None:
         """Update the warning line and collapse it to zero rows when there's nothing to say."""

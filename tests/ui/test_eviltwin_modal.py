@@ -7,7 +7,7 @@ from textual.widgets import Checkbox, Input, Select
 from wifit3.chips.driver import FakeMacSupport
 from wifit3.campaigns.eviltwin import EvilTwinPreset, PuntMode, PortalTemplate
 from wifit3.ui.screens.focus_v2.eviltwin_modal import (
-    EvilTwinInputModal, _plus_one, _random_bssid, _CYCLES,
+    EvilTwinInputModal, _plus_one, _random_bssid, _CYCLES, _CLONE_REAL_LABEL,
 )
 
 _MAC = re.compile(r"^([0-9a-f]{2}:){5}[0-9a-f]{2}$")
@@ -273,6 +273,14 @@ async def test_single_card_open_target_has_no_clone_option():
     assert result and result[0].clone_real_portal is False
 
 
+def test_clone_real_label_fits_the_dropdown_overlay_width():
+    """The dropdown overlay renders at ~30 columns (dialog width 60, minus the row-label column
+    and borders, confirmed by inspecting SelectOverlay's rendered option width directly): a
+    longer label gets truncated to near-unrecognizability, which is what "clone is no longer
+    there as an option" actually was -- not a missing option, an unreadable one."""
+    assert len(_CLONE_REAL_LABEL) <= 28
+
+
 async def test_dual_card_open_target_clone_selection_flows_through():
     a, b = _mounted_iface("Card A"), _mounted_iface("Card B")
     target = _mounted_target(akm_suites=())
@@ -292,6 +300,26 @@ async def test_dual_card_open_target_clone_selection_flows_through():
 
     assert result and result[0].clone_real_portal is True
     assert result[0].portal_template is PortalTemplate.PASSWORD   # fallback if the fetch fails
+
+
+async def test_selecting_clone_shows_the_delay_warning():
+    """The "(2 cards, adds delay)" detail moved out of the (now-shortened) label and into the
+    warning line, shown only once the option is actually selected."""
+    a, b = _mounted_iface("Card A"), _mounted_iface("Card B")
+    target = _mounted_target(akm_suites=())
+    result = []
+
+    class _Host(App):
+        def on_mount(self) -> None:
+            self.push_screen(EvilTwinInputModal(target, [a, b]), result.append)
+
+    async with _Host().run_test(size=(100, 50)) as pilot:
+        await pilot.pause()
+        modal = pilot.app.screen
+        assert "delay" not in str(modal.query_one("#warn").render())
+        modal.query_one("#portal-template", Select).value = "clone_real"
+        await pilot.pause()
+        assert "delay" in str(modal.query_one("#warn").render())
 
 
 async def test_selecting_a_static_template_never_sets_clone_real_portal():
