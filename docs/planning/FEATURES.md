@@ -230,14 +230,15 @@ separately over an isolated addressed TAP (the two-role test collides both roles
 `10.13.37.0/24` subnet in one netns — a same-host test artifact, not reproducible against a real,
 physically separate target).
 
-**Known limitation, not attempted:** a cloned page whose login form submits over HTTPS can't be
-intercepted — this app runs a plain HTTP portal server, and terminating TLS for an arbitrary
-hostname would need generating a matching cert and getting the client to trust it (full MITM,
-a much bigger and riskier build). `portal_fetch.py` already refuses to chase an HTTPS redirect
-when *fetching* the real portal for the same reason, so this is a symmetric, deliberate boundary
-rather than a one-sided gap. A cloned page's *non-form* assets (CSS/JS/images on other domains)
-still load normally through the shared internet connection when NAT is up, so styling is usually
-intact even though the two are unrelated mechanisms.
+**Known limitation, not attempted:** *serving* a cloned page whose login form submits over HTTPS
+can't be intercepted — this app runs a plain HTTP portal server, and terminating TLS for an
+arbitrary hostname would need generating a matching cert and getting the client to trust it (full
+MITM, a much bigger and riskier build). This is now a one-sided gap, not symmetric: *fetching*
+the real portal for cloning purposes does chase an HTTPS redirect (see HTTPS fetch support below)
+since that's just a normal client GET of a real site's content, not interception of a victim's
+traffic — the two are different problems with different risk profiles. A cloned page's *non-form*
+assets (CSS/JS/images on other domains) still load normally through the shared internet connection
+when NAT is up, so styling is usually intact even though the two are unrelated mechanisms.
 
 **force_open (done, beyond the original Stage 2b scope):** `EvilTwinInput.force_open` twins a
 *secured* target open anyway (no 4-way, no capture) instead of requiring the target to already be
@@ -253,6 +254,43 @@ connectivity-check path (Apple `hotspot-detect.html`/`success.html`, Android `ge
 Windows `connecttest.txt`/`ncsi.txt`, Firefox `success.txt`) with the literal "you have real
 internet" response once a client is authorized — otherwise the OS's own probe never stops seeing
 a redirect and its sign-in sheet never dismisses itself, even after the user submits the form.
+
+**A cloned real portal was never actually interactive (done, beyond original Stage 2b scope):**
+`net/http_portal.py` only ever treated a POST as "user submitted the form" — but nodogsplash's
+real login form is `method="GET"` and so is openNDS's (`/opennds_preauth/`), so a genuinely
+cloned real page's own "Continue"/login click never authorized the client at all, it just looped
+back to the portal. The whole "clone the real portal" feature had never actually worked
+end-to-end for a real fetched page, for either supported captive portal. Fixed: an unrecognized
+GET from an unauthorized client (not `/`, not a known OS connectivity-check path, not the page's
+own local asset refs) now authorizes exactly like a POST does. Also added `net/portal_assets.py`
+(extracts a fetched page's own `<img>`/`<link>`/`<script>` refs) and
+`portal_http_client.py:fetch_page_with_assets` (fetches them too, from wherever the page itself
+landed after redirects — its real GatewayPort, not port 80, which both nodogsplash and openNDS
+blanket-redirect regardless of path). Caught a real bug along the way testing against openNDS's
+actual page: it HTML-entity-escapes slashes in its own attribute values
+(`href="http:&#47;&#47;..."`), which needs unescaping before URL parsing.
+
+**Verified end-to-end on real hardware**, using genuinely fetched real content (not synthetic
+templates) against two different real captive-portal implementations — nodogsplash, and openNDS
+(both its login modes: click-to-continue and username/email): real page + real images/CSS served
+correctly, the real login form's own submit/continue click correctly authorizes, and a subsequent
+request gets the success page instead of looping.
+
+**HTTPS fetch support (done, beyond original Stage 2b scope):** some real captive portals are
+HTTPS-only end to end — `portal_http_client.py` previously refused to chase any HTTPS redirect at
+all, so the real page could never even be *retrieved* for cloning against such a target (confirmed
+live against a real carrier "community WiFi" portal). The redirect-chasing loop now tracks scheme
+alongside host/port and wraps the socket in a real TLS connection (SNI + default certificate
+verification against the actual hostname) on an https hop. See the "Known limitation" note above
+for why this doesn't extend to *serving* a cloned page over HTTPS.
+
+**Association Capability Info claimed Privacy against open targets (real bug, not eviltwin-
+specific):** `dot11/auth_assoc.py:assoc_req()` hardcoded the Capability Information field to
+ESS+Privacy on every association, including confirmed-open ones — a real 802.11 spec mismatch. A
+lenient hostapd test AP never cared, but a real carrier "community WiFi" AP validated it strictly
+and rejected association outright with status 12. Added a `privacy` parameter (default `True`,
+preserving existing WPS/PMKID/WPS-PIN behavior against WPA/WPA2 targets); EvilTwin's real-portal
+fetch now passes `privacy=False`, since it only ever targets a confirmed-open AP.
 
 More portal templates: `VOUCHER` (access code), `PHONE` (number capture), `ROOM` (hotel room +
 surname), alongside the original `PASSWORD`/`LOGIN`/`CLICKTHROUGH`.
