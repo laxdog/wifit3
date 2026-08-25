@@ -1,8 +1,12 @@
-"""Wildcard DNS: every A query answers with our own IP, so any hostname (including each OS's
-captive-portal-detection probe) resolves to us. AAAA answers NOERROR/no-record so a client
-racing A and AAAA (Happy Eyeballs) doesn't wait out an IPv6 timeout before trying IPv4. No
-recursion, no other record types, no upstream forwarding: this is a captive network, not a
-resolver.
+"""Wildcard DNS for an unauthorized client: every A query answers with our own IP, so any
+hostname (including each OS's captive-portal-detection probe) resolves to us and the
+captive-portal flow triggers. AAAA answers NOERROR/no-record so a client racing A and AAAA
+(Happy Eyeballs) doesn't wait out an IPv6 timeout before trying IPv4.
+
+Once a client is authorized (POSTed the portal form -- ``authorized`` is the same set
+HttpPortalServer marks), its queries are instead forwarded to a real upstream resolver and the
+reply relayed back verbatim: without this, internet sharing (NAT) is pointless, since every
+hostname the client looks up would still resolve back to us regardless of routing.
 """
 from __future__ import annotations
 
@@ -10,7 +14,7 @@ import asyncio
 import logging
 import socket
 import struct
-from typing import Optional
+from typing import Optional, Set, Tuple
 
 from wifit3.net.tap import SETCAP_HINT, TapPermissionError
 
@@ -19,6 +23,8 @@ logger = logging.getLogger(__name__)
 _PORT = 53
 _TYPE_A, _TYPE_AAAA = 1, 28
 _CLASS_IN = 1
+_UPSTREAM_DNS = "1.1.1.1"
+_MAX_PENDING = 256   # bounds a lost-upstream-reply leak over a long session
 
 
 def _parse_question(packet: bytes) -> Optional[tuple[bytes, int, int]]:
@@ -55,12 +61,18 @@ def build_reply(query: bytes, ip: str) -> Optional[bytes]:
 
 
 class DnsServer:
-    """One reply per query, scoped (``SO_BINDTODEVICE``) to just the TAP interface."""
+    """One reply per query, scoped (``SO_BINDTODEVICE``) to the TAP -- except an authorized
+    client's queries, forwarded via the plain (unscoped) upstream socket instead."""
 
-    def __init__(self, tap_name: str, *, answer_ip: str):
+    def __init__(self, tap_name: str, *, answer_ip: str, authorized: Optional[Set[str]] = None,
+                upstream: str = _UPSTREAM_DNS):
         self.tap_name = tap_name
         self.answer_ip = answer_ip
+        self.authorized = authorized if authorized is not None else set()
+        self.upstream = upstream
         self._sock: Optional[socket.socket] = None
+        self._upstream_sock: Optional[socket.socket] = None
+        self._pending: dict[bytes, Tuple[str, int]] = {}   # DNS transaction id -> client addr
 
     def start(self) -> None:
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -73,23 +85,33 @@ class DnsServer:
             sock.close()
             raise TapPermissionError(SETCAP_HINT) from exc
         sock.setblocking(False)
-        self._sock = sock
-        asyncio.get_running_loop().add_reader(sock.fileno(), self._on_readable)
+        upstream_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        upstream_sock.setblocking(False)
+        self._sock, self._upstream_sock = sock, upstream_sock
+        loop = asyncio.get_running_loop()
+        loop.add_reader(sock.fileno(), self._on_readable)
+        loop.add_reader(upstream_sock.fileno(), self._on_upstream_readable)
 
     def stop(self) -> None:
-        if self._sock is None:
-            return
-        try:
-            asyncio.get_running_loop().remove_reader(self._sock.fileno())
-        except RuntimeError:
-            pass
-        self._sock.close()
-        self._sock = None
+        loop = asyncio.get_running_loop()
+        for sock in (self._sock, self._upstream_sock):
+            if sock is None:
+                continue
+            try:
+                loop.remove_reader(sock.fileno())
+            except RuntimeError:
+                pass
+            sock.close()
+        self._sock = self._upstream_sock = None
+        self._pending.clear()
 
     def _on_readable(self) -> None:
         try:
             data, addr = self._sock.recvfrom(512)
         except (BlockingIOError, OSError):
+            return
+        if addr[0] in self.authorized:
+            self._forward(data, addr)
             return
         reply = build_reply(data, self.answer_ip)
         if reply is None:
@@ -98,3 +120,27 @@ class DnsServer:
             self._sock.sendto(reply, addr)
         except OSError:
             logger.debug("dns: reply send failed", exc_info=True)
+
+    def _forward(self, query: bytes, client_addr: Tuple[str, int]) -> None:
+        if len(query) < 2:
+            return
+        if len(self._pending) >= _MAX_PENDING:
+            self._pending.pop(next(iter(self._pending)))     # drop the oldest, bound the growth
+        self._pending[query[0:2]] = client_addr
+        try:
+            self._upstream_sock.sendto(query, (self.upstream, _PORT))
+        except OSError:
+            logger.debug("dns: upstream forward failed", exc_info=True)
+
+    def _on_upstream_readable(self) -> None:
+        try:
+            data, _addr = self._upstream_sock.recvfrom(512)
+        except (BlockingIOError, OSError):
+            return
+        client_addr = self._pending.pop(data[0:2], None) if len(data) >= 2 else None
+        if client_addr is None:
+            return
+        try:
+            self._sock.sendto(data, client_addr)
+        except OSError:
+            logger.debug("dns: reply relay failed", exc_info=True)

@@ -45,14 +45,24 @@ _CAPTIVE_CHECK_RESPONSES: dict[str, tuple[int, str, str]] = {
 }
 _STATUS_REASON = {200: "OK", 204: "No Content"}
 
+# Apple's CNA sheet reacts to its OWN webview navigating to hotspot-detect.html and seeing the
+# exact expected body -- it closes itself right then, rather than waiting out its own background
+# recheck timer. Redirecting the POST response there (only for CNA's own browser, identified by
+# its distinctive UA, so a normal browser still gets a real "connected" page) is what makes
+# sign-in feel instant on iOS/macOS instead of leaving the sheet open for up to a minute.
+_APPLE_CNA_UA_MARKER = "captivenetworksupport"
+
 
 class HttpPortalServer:
-    def __init__(self, tap_name: str, *, page: str, on_submit: Optional[Callable[[dict], None]] = None):
+    def __init__(self, tap_name: str, *, page: str, on_submit: Optional[Callable[[dict], None]] = None,
+                authorized: Optional[Set[str]] = None):
         self.tap_name = tap_name
         self.page = page
         self.on_submit = on_submit or (lambda _fields: None)
         self.submissions: List[dict] = []
-        self._authorized: Set[str] = set()     # source IPs that have already submitted the form
+        # source IPs that have already submitted the form; shared with DnsServer when given, so
+        # DNS can stop wildcard-hijacking (and start forwarding for real) the moment HTTP does.
+        self._authorized: Set[str] = authorized if authorized is not None else set()
         self._server = None
 
     async def start(self) -> None:
@@ -90,7 +100,10 @@ class HttpPortalServer:
                 self.on_submit(fields)
                 if client_ip is not None:
                     self._authorized.add(client_ip)
-                await self._respond(writer, 200, _SUCCESS_PAGE)
+                if _APPLE_CNA_UA_MARKER in headers.get("user-agent", "").lower():
+                    await self._redirect(writer, "/hotspot-detect.html")
+                else:
+                    await self._respond(writer, 200, _SUCCESS_PAGE)
             elif client_ip in self._authorized:
                 await self._handle_authorized(writer, path)
             elif path == "/":

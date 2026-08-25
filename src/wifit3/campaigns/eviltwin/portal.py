@@ -26,9 +26,13 @@ class PortalStack:
                 on_submit: Optional[Callable[[dict], None]] = None,
                 page_override: Optional[str] = None):
         page = page_override if page_override is not None else render(template, ssid)
+        # Shared with DnsServer: the moment HTTP marks a client authorized, DNS stops
+        # wildcard-hijacking its queries too -- otherwise NAT's internet sharing is pointless,
+        # since every hostname the client looks up would still resolve straight back to us.
+        authorized: set = set()
         self.bridge = IpBridge(twin_iface, bssid, tap_name)
-        self.dns = DnsServer(tap_name, answer_ip=SERVER_IP)
-        self.http = HttpPortalServer(tap_name, page=page, on_submit=on_submit)
+        self.dns = DnsServer(tap_name, answer_ip=SERVER_IP, authorized=authorized)
+        self.http = HttpPortalServer(tap_name, page=page, on_submit=on_submit, authorized=authorized)
         self.nat = NatGateway(tap_name, SUBNET)
         self.nat_error: Optional[str] = None
         self._http_started = False

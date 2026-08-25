@@ -18,6 +18,15 @@ def test_no_override_falls_back_to_the_template():
     assert stack.http.page == render(PortalTemplate.LOGIN, "GL-Test")
 
 
+def test_dns_and_http_share_the_same_authorized_set():
+    """DNS must stop wildcarding a client the instant HTTP marks it authorized, or NAT's
+    internet sharing is pointless -- every hostname would still resolve back to us."""
+    stack = PortalStack(twin_iface=object(), bssid=_BSSID, ssid="GL-Test")
+    assert stack.dns.authorized is stack.http._authorized
+    stack.http._authorized.add("10.13.37.100")
+    assert "10.13.37.100" in stack.dns.authorized
+
+
 def _stack(mocker) -> PortalStack:
     stack = PortalStack(twin_iface=mocker.MagicMock(), bssid=_BSSID, ssid="GL-Test")
     stack.bridge = mocker.MagicMock(start=mocker.MagicMock(), stop=mocker.MagicMock())

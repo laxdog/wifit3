@@ -29,7 +29,14 @@ _ASSOC_ATTEMPTS = 2
 _DHCP_TIMEOUT = 10.0
 _DHCP_RETRIES = 5
 _HTTP_TIMEOUT = 5.0
-_OVERALL_TIMEOUT = 30.0
+# Must comfortably exceed the sum of everything it wraps, or a real (imperfect-RF, slightly slow)
+# target gets cut off by this watchdog before finishing, even though every step would eventually
+# succeed on its own: worst case is ~10s assoc + ~20s DHCP (DISCOVER + REQUEST phases, each up to
+# _DHCP_TIMEOUT) + up to _MAX_REDIRECTS hops of the gateway fetch (DNS + connect + request, each
+# up to _HTTP_TIMEOUT) + the same again for the probe-host fallback. 30s was tighter than that
+# sum -- confirmed by reasoning through it, not just guessed -- so real-world fetches could time
+# out here even when every individual step was actually working.
+_OVERALL_TIMEOUT = 75.0
 
 # Not every captive portal listens on its own gateway IP -- some (cloud-hosted controllers,
 # transparent proxies) only intercept traffic bound elsewhere. Apple's own probe URL is what a

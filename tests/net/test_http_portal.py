@@ -131,6 +131,29 @@ async def test_authorized_client_gets_success_page_on_other_paths(server):
     assert b"connected" in resp.lower()
 
 
+async def test_apple_cna_post_gets_redirected_to_hotspot_detect(server):
+    """CNA's own webview navigating to its check URL and seeing "Success" is what makes the
+    sign-in sheet close itself immediately, instead of waiting on CNA's own background timer."""
+    srv, port = server
+    body = b"password=hunter2"
+    req = (b"POST / HTTP/1.1\r\nHost: x\r\n"
+          b"User-Agent: CaptiveNetworkSupport-359.60.4 wispr\r\n"
+          b"Content-Length: " + str(len(body)).encode() + b"\r\n\r\n" + body)
+    resp = await _request(port, req)
+    assert resp.startswith(b"HTTP/1.1 302")
+    assert b"Location: /hotspot-detect.html" in resp
+
+
+async def test_non_apple_post_gets_the_normal_success_page(server):
+    srv, port = server
+    body = b"password=hunter2"
+    req = (b"POST / HTTP/1.1\r\nHost: x\r\nUser-Agent: Mozilla/5.0\r\n"
+          b"Content-Length: " + str(len(body)).encode() + b"\r\n\r\n" + body)
+    resp = await _request(port, req)
+    assert resp.startswith(b"HTTP/1.1 200")
+    assert b"connected" in resp.lower()
+
+
 async def test_malformed_request_line_closes_without_crashing(server):
     srv, port = server
     resp = await _request(port, b"garbage\r\n\r\n")     # not "METHOD path ..." shaped
