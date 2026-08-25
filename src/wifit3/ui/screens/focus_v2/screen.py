@@ -202,6 +202,8 @@ class FocusViewV2(Screen):
         self._eviltwin_attack: Optional[EvilTwinCampaign] = None
         self._eviltwin_client_logged = False   # has "a client joined" already been logged?
         self._eviltwin_submissions_seen = 0    # portal_submissions already logged+saved
+        self._eviltwin_fetch_start_logged = False   # has the real-portal fetch start been logged?
+        self._eviltwin_fetch_done_logged = False    # has its outcome been logged?
         self._pbc_campaign: Optional[WpsPbcCapture] = None
         self._pbc_user_stopped = False
         self._pbc_retry_after = 0.0   # monotonic time before which we won't re-arm a PBC retry
@@ -907,6 +909,8 @@ class FocusViewV2(Screen):
             self._eviltwin_attack.run()
             self._eviltwin_client_logged = False
             self._eviltwin_submissions_seen = 0
+            self._eviltwin_fetch_start_logged = False
+            self._eviltwin_fetch_done_logged = False
         except Exception as exc:
             logger.exception("EvilTwin start failed")
             self._log(f"[bold red]✗ EvilTwin failed to start:[/bold red] {escape(str(exc))}")
@@ -928,9 +932,23 @@ class FocusViewV2(Screen):
         self._log("[bold red]EvilTwin stopped[/bold red]")
 
     def _poll_eviltwin_live_events(self) -> None:
-        """Log + persist events live: a client joining, and each portal submission. Otherwise
-        invisible until the run ends, which an open twin may never do on its own."""
+        """Log + persist live: a client joining, each portal submission, and the real-portal
+        clone's own progress. Otherwise invisible until the run ends (an open twin may never)."""
         camp = self._eviltwin_attack
+        fetching = getattr(camp, "fetching_real_portal", False)
+        if not self._eviltwin_fetch_start_logged and fetching:
+            self._eviltwin_fetch_start_logged = True
+            self._log(treelog.leaf("[italic]cloning the real captive portal…[/italic] "
+                                   "[dim]associating on the punt/fetch card[/dim]"))
+        fetch_status = getattr(camp, "portal_fetch_status", None)
+        if (self._eviltwin_fetch_start_logged and not self._eviltwin_fetch_done_logged
+                and not fetching and fetch_status is not None):
+            self._eviltwin_fetch_done_logged = True
+            if getattr(camp, "cloned_real_portal", False):
+                self._log(treelog.leaf_ok(f"[bold green]✓ {escape(fetch_status)}[/bold green]"))
+            else:
+                self._log(treelog.leaf(f"[dim]{escape(fetch_status)}: "
+                                       "falling back to the template[/dim]"))
         if not self._eviltwin_client_logged and camp.client_joined:
             self._eviltwin_client_logged = True
             self._log(treelog.leaf_ok(

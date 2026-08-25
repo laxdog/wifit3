@@ -22,6 +22,9 @@ _PORTAL_TEMPLATES = [("WiFi password", PortalTemplate.PASSWORD.value),
                      ("Access code / voucher", PortalTemplate.VOUCHER.value),
                      ("Phone number", PortalTemplate.PHONE.value),
                      ("Hotel room + last name", PortalTemplate.ROOM.value)]
+_CLONE_REAL_VALUE = "clone_real"   # sentinel Select value: not a PortalTemplate, a behavior flag
+_CLONE_REAL_LABEL = "Clone the real captive portal (2 cards, adds delay)"
+_CLONE_REAL_FALLBACK = PortalTemplate.PASSWORD   # used only if the live fetch fails
 
 _MAC_RE = re.compile(r"^([0-9a-f]{2}:){5}[0-9a-f]{2}$")
 
@@ -112,7 +115,7 @@ class EvilTwinInputModal(ModalScreen[Optional[EvilTwinInput]]):
                         yield Button("Rand", id="bssid-random")
 
             with Horizontal(classes="row"):
-                yield Label("Punter interface", classes="row-label")
+                yield Label("Punt / fetch interface", classes="row-label")
                 yield Select([(display_name(m), m.name) for m in self._punters],
                              value=punter.name if punter else Select.BLANK,
                              allow_blank=False, id="punt-iface")
@@ -127,10 +130,8 @@ class EvilTwinInputModal(ModalScreen[Optional[EvilTwinInput]]):
 
             with Horizontal(classes="row", id="portal-template-row"):
                 yield Label("Portal page", classes="row-label")
-                yield Select(_PORTAL_TEMPLATES, value=PortalTemplate.PASSWORD.value,
+                yield Select(self._portal_options(), value=PortalTemplate.PASSWORD.value,
                              allow_blank=False, id="portal-template")
-            if not self._single:                         # needs a spare radio to do the fetch on
-                yield Checkbox("Clone the real portal page", value=False, id="clone-real-portal")
 
             with Vertical(id="punt-methods"):
                 yield Checkbox("De-authenticate", value=PuntMode.DEAUTH in d_modes,
@@ -154,8 +155,6 @@ class EvilTwinInputModal(ModalScreen[Optional[EvilTwinInput]]):
         self._sync_bssid_field()
         self._sync_warning()
         self._sync_portal_visibility()
-        if not self._single:
-            self.query_one("#clone-real-portal", Checkbox).tooltip = "Needs 2 cards; adds delay"
         if self.target.pmf_required:                # robust-frame punts can't be forged under PMF
             self.query_one("#punt-deauth", Checkbox).tooltip = "Can't send deauths: PMF active"
             self.query_one("#punt-btm", Checkbox).tooltip = "Can't send BTMs: PMF active"
@@ -211,12 +210,17 @@ class EvilTwinInputModal(ModalScreen[Optional[EvilTwinInput]]):
         return self.query_one("#force-open", Checkbox).value
 
     def _sync_portal_visibility(self) -> None:
-        """The portal-page picker and real-portal-clone checkbox only make sense once the twin is
-        actually open: an unforced secured target still runs the downgrade/capture flow instead."""
-        visible = self._open_effective()
-        self.query_one("#portal-template-row").display = visible
+        """The portal-page picker only makes sense once the twin is actually open: an unforced
+        secured target still runs the downgrade/capture flow instead."""
+        self.query_one("#portal-template-row").display = self._open_effective()
+
+    def _portal_options(self) -> List:
+        """The real-clone option lives in this same picker, not a separate checkbox: it's
+        mutually exclusive with every static template. Dual-card only (needs a spare radio)."""
+        options = list(_PORTAL_TEMPLATES)
         if not self._single:
-            self.query_one("#clone-real-portal", Checkbox).display = visible
+            options = [(_CLONE_REAL_LABEL, _CLONE_REAL_VALUE)] + options
+        return options
 
     # ----- presets -------------------------------------------------------------
 
@@ -322,10 +326,10 @@ class EvilTwinInputModal(ModalScreen[Optional[EvilTwinInput]]):
         target_client = self.query_one("#target-client", Select).value or None
         force_open = self.target.akm_suites and self.query_one("#force-open", Checkbox).value
         open_effective = self._open_effective()
-        template = (PortalTemplate(self.query_one("#portal-template", Select).value) if open_effective
-                   else PortalTemplate.PASSWORD)
-        clone_real_portal = (open_effective and not self._single
-                            and self.query_one("#clone-real-portal", Checkbox).value)
+        portal_choice = self.query_one("#portal-template", Select).value
+        clone_real_portal = open_effective and portal_choice == _CLONE_REAL_VALUE
+        template = (_CLONE_REAL_FALLBACK if clone_real_portal
+                   else PortalTemplate(portal_choice) if open_effective else PortalTemplate.PASSWORD)
         self.dismiss(EvilTwinInput(
             twin_iface=twin, punt_iface=punter, twin_channel=channel, twin_bssid=twin_bssid,
             punt_modes=self._punt_modes(target_client), csa_channel=None, punt_period_sec=period,

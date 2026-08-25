@@ -4,11 +4,16 @@ instead of a generic template. Runs before the twin arms, on the punt card (dual
 there's no spare radio for this in single-card mode). Always best-effort: any failure at any
 stage (no assoc, no DHCP, no portal, target unreachable) just means falling back to the generic
 template afterward -- this never raises, and never blocks the twin from starting without it.
+
+``FetchResult.status`` is always set (success or failure) with a specific, human-readable reason:
+surfaced live in the UI log (``screen.py``) so a failed clone attempt says *why*, not just that it
+failed -- association vs. DHCP vs. an unreachable/HTTPS-only portal are very different problems.
 """
 from __future__ import annotations
 
 import asyncio
 import logging
+from dataclasses import dataclass
 from typing import Optional
 
 from wifit3.campaigns.auth_assoc import Association, build_client_leaving, random_client_mac
@@ -47,17 +52,27 @@ _PROBE_PATH = "/hotspot-detect.html"
 _NOT_CAPTIVE_MARKER = "<BODY>Success</BODY>"   # the literal, un-intercepted Apple response
 
 
-async def fetch_real_portal(array, iface, bssid: str, ssid: str, channel: int) -> Optional[str]:
-    """Associate to the real target, DHCP, and fetch whatever it serves on port 80. None on any
-    failure: always best-effort, so the caller just falls back to the generic template."""
+@dataclass
+class FetchResult:
+    page: Optional[str]
+    status: str     # always set: the specific outcome, success or failure
+
+
+async def fetch_real_portal(array, iface, bssid: str, ssid: str, channel: int) -> FetchResult:
+    """Associate, DHCP, and fetch whatever the target serves on port 80. ``page`` is None on any
+    failure (best-effort: falls back to a template); ``status`` always says what happened."""
     try:
         return await asyncio.wait_for(_fetch(array, iface, bssid, ssid, channel), _OVERALL_TIMEOUT)
+    except asyncio.TimeoutError:
+        status = f"timed out after {_OVERALL_TIMEOUT:.0f}s"
+        logger.info("eviltwin: real-portal fetch: %s", status)
+        return FetchResult(None, status)
     except Exception as exc:                                    # noqa: BLE001
         logger.info("eviltwin: real-portal fetch failed: %s", exc)
-        return None
+        return FetchResult(None, f"unexpected error: {exc}")
 
 
-async def _fetch(array, iface, bssid: str, ssid: str, channel: int) -> Optional[str]:
+async def _fetch(array, iface, bssid: str, ssid: str, channel: int) -> FetchResult:
     our_mac = random_client_mac()
     bssid_bytes = str_to_mac(bssid)
     async with array.lease(channel=channel, iface=iface) as leased:
@@ -69,13 +84,16 @@ async def _fetch(array, iface, bssid: str, ssid: str, channel: int) -> Optional[
 
 
 async def _associate_and_fetch(iface, bssid_bytes: bytes, bssid: str, ssid: str, channel: int,
-                               our_mac: bytes) -> Optional[str]:
+                               our_mac: bytes) -> FetchResult:
     assoc = Association(iface, bssid, ssid, channel, our_mac=our_mac)
     assoc.start()
     try:
+        logger.info("eviltwin: real-portal fetch: associating to %s on ch %d", bssid, channel)
         if not await assoc.associate(attempts=_ASSOC_ATTEMPTS):
-            logger.info("eviltwin: real-portal fetch: association failed (%s)", assoc.fail_reason)
-            return None
+            status = f"association failed ({assoc.fail_reason or 'no response'})"
+            logger.info("eviltwin: real-portal fetch: %s", status)
+            return FetchResult(None, status)
+        logger.info("eviltwin: real-portal fetch: associated, requesting a DHCP lease")
         dhcp_frames: "asyncio.Queue[bytes]" = asyncio.Queue()
         bridge = ClientBridge(iface, bssid_bytes, our_mac, tap_name=TAP_NAME,
                               on_eth_frame=dhcp_frames.put_nowait)
@@ -90,8 +108,11 @@ async def _associate_and_fetch(iface, bssid_bytes: bytes, bssid: str, ssid: str,
             lease = await request_lease(our_mac, bridge._on_tap_frame, dhcp_frames,
                                         timeout=_DHCP_TIMEOUT, retries=_DHCP_RETRIES)
             if lease is None or lease.router is None:
-                logger.info("eviltwin: real-portal fetch: no DHCP lease from the target")
-                return None
+                status = "no DHCP lease from the target"
+                logger.info("eviltwin: real-portal fetch: %s", status)
+                return FetchResult(None, status)
+            logger.info("eviltwin: real-portal fetch: got lease %s via %s, fetching the portal",
+                       lease.ip, lease.router)
             bridge.tap.add_address(lease.ip, lease.prefix)
             return await _fetch_page(lease)
         finally:
@@ -104,18 +125,35 @@ async def _associate_and_fetch(iface, bssid_bytes: bytes, bssid: str, ssid: str,
         assoc.stop()
 
 
-async def _fetch_page(lease: DhcpLease) -> Optional[str]:
+async def _fetch_page(lease: DhcpLease) -> FetchResult:
     """The gateway first (many portals listen there directly); if that comes back empty and we
     have a DNS server, fall back to the probe-host approach a real device would use."""
     page = await fetch_portal_page(TAP_NAME, lease.router, dns_ip=lease.dns, timeout=_HTTP_TIMEOUT)
-    if page is not None or lease.dns is None:
-        return page
+    if page is not None:
+        status = f"fetched from the gateway ({len(page)} bytes)"
+        logger.info("eviltwin: real-portal fetch: %s", status)
+        return FetchResult(page, status)
+    if lease.dns is None:
+        status = "gateway had nothing to serve, and no DNS server to try the probe-host fallback"
+        logger.info("eviltwin: real-portal fetch: %s", status)
+        return FetchResult(None, status)
+    logger.info("eviltwin: real-portal fetch: gateway had nothing, trying %s%s",
+               _PROBE_HOST, _PROBE_PATH)
     probe_ip = await resolve_dns(TAP_NAME, lease.dns, _PROBE_HOST, timeout=_HTTP_TIMEOUT)
     if probe_ip is None:
-        return None
+        status = f"gateway had nothing, and couldn't resolve {_PROBE_HOST} to try the fallback"
+        logger.info("eviltwin: real-portal fetch: %s", status)
+        return FetchResult(None, status)
     page = await fetch_portal_page(TAP_NAME, probe_ip, dns_ip=lease.dns, path=_PROBE_PATH,
                                    timeout=_HTTP_TIMEOUT)
     if page is not None and _NOT_CAPTIVE_MARKER in page:
-        logger.info("eviltwin: real-portal fetch: target has no captive portal (real internet)")
-        return None
-    return page
+        status = "target has real internet (no captive portal to clone)"
+        logger.info("eviltwin: real-portal fetch: %s", status)
+        return FetchResult(None, status)
+    if page is not None:
+        status = f"fetched via the probe-host fallback ({len(page)} bytes)"
+        logger.info("eviltwin: real-portal fetch: %s", status)
+        return FetchResult(page, status)
+    status = "gateway and the probe-host fallback both failed (HTTPS-only portal?)"
+    logger.info("eviltwin: real-portal fetch: %s", status)
+    return FetchResult(None, status)

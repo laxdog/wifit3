@@ -10,6 +10,7 @@ from wifit3.campaigns.eviltwin import (
     EvilTwinCampaign, EvilTwinInput, PuntMode, default_punt_modes, csa_target_channel,
     ClientPhase, ClientProgress,
 )
+from wifit3.campaigns.eviltwin.portal_fetch import FetchResult
 from wifit3.dot11.ap import eapol_m1
 from wifit3.dot11.eapol import eapol_key, data_header, LLC_SNAP_EAPOL
 from wifit3.dot11.ie import ssid_ie, rates_ie, ds_param_ie, GENERIC_RSN_IE
@@ -377,8 +378,8 @@ async def test_clone_real_portal_skipped_when_secured(mocker):
 
 async def test_clone_real_portal_allowed_on_secured_target_when_forced_open(mocker):
     array, twin, punt = _FakeArray(), _FakeIface(), _FakeIface(11)
-    fetch = mocker.patch("wifit3.campaigns.eviltwin.campaign.fetch_real_portal",
-                         mocker.AsyncMock(return_value="<html>the real page</html>"))
+    fetch = mocker.patch("wifit3.campaigns.eviltwin.campaign.fetch_real_portal", mocker.AsyncMock(
+        return_value=FetchResult("<html>the real page</html>", "fetched from the gateway")))
     stack = mocker.MagicMock(start=mocker.AsyncMock(), stop=mocker.AsyncMock())
     mocker.patch("wifit3.campaigns.eviltwin.campaign.PortalStack", return_value=stack)
     inp = EvilTwinInput(twin_iface=twin, punt_iface=punt, twin_channel=1, twin_bssid=_BSSID,
@@ -409,8 +410,8 @@ async def test_clone_real_portal_skipped_when_flag_off(mocker):
 
 async def test_clone_real_portal_success_marks_cloned_and_feeds_the_page(mocker):
     array, twin, punt = _FakeArray(), _FakeIface(), _FakeIface(11)
-    fetch = mocker.patch("wifit3.campaigns.eviltwin.campaign.fetch_real_portal",
-                         mocker.AsyncMock(return_value="<html>the real page</html>"))
+    fetch = mocker.patch("wifit3.campaigns.eviltwin.campaign.fetch_real_portal", mocker.AsyncMock(
+        return_value=FetchResult("<html>the real page</html>", "fetched from the gateway")))
     stack = mocker.MagicMock(start=mocker.AsyncMock(), stop=mocker.AsyncMock())
     portal_stack_cls = mocker.patch("wifit3.campaigns.eviltwin.campaign.PortalStack",
                                     return_value=stack)
@@ -423,13 +424,14 @@ async def test_clone_real_portal_success_marks_cloned_and_feeds_the_page(mocker)
 
     fetch.assert_awaited_once()
     assert camp.cloned_real_portal is True and camp.portal_fetch_error is None
+    assert camp.portal_fetch_status == "fetched from the gateway"
     assert portal_stack_cls.call_args.kwargs["page_override"] == "<html>the real page</html>"
 
 
 async def test_clone_real_portal_failure_falls_back_to_template(mocker):
     array, twin, punt = _FakeArray(), _FakeIface(), _FakeIface(11)
-    mocker.patch("wifit3.campaigns.eviltwin.campaign.fetch_real_portal",
-                mocker.AsyncMock(return_value=None))
+    mocker.patch("wifit3.campaigns.eviltwin.campaign.fetch_real_portal", mocker.AsyncMock(
+        return_value=FetchResult(None, "no DHCP lease from the target")))
     stack = mocker.MagicMock(start=mocker.AsyncMock(), stop=mocker.AsyncMock())
     portal_stack_cls = mocker.patch("wifit3.campaigns.eviltwin.campaign.PortalStack",
                                     return_value=stack)
@@ -441,7 +443,7 @@ async def test_clone_real_portal_failure_falls_back_to_template(mocker):
     await camp.teardown()
 
     assert camp.cloned_real_portal is False
-    assert camp.portal_fetch_error is not None
+    assert camp.portal_fetch_error == "no DHCP lease from the target"
     assert portal_stack_cls.call_args.kwargs["page_override"] is None
 
 

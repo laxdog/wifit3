@@ -94,6 +94,9 @@ class _FakeEvilTwin:
         self.twin_channel = 6
         self.fakeap = None
         self.done = False
+        self.fetching_real_portal = False
+        self.cloned_real_portal = False
+        self.portal_fetch_status = None
 
 
 def _log_text(band: LogBand) -> str:
@@ -156,6 +159,59 @@ async def test_portal_submission_logged_and_saved():
     saved = list(Path("captures").glob("*_portal.txt"))
     assert len(saved) == 1
     assert "password: hunter2" in saved[0].read_text()
+
+
+async def test_real_portal_clone_success_logged_live():
+    iface, array, ap = _open_target()
+    app = _Host(array, ap)
+    async with app.run_test(size=(120, 40)) as pilot:
+        await pilot.pause(0)
+        focus = app.screen
+        focus._tick_timer.stop()
+        focus._target_ap = ap
+        camp = _FakeEvilTwin(ap)
+        focus._eviltwin_attack = camp
+
+        camp.fetching_real_portal = True
+        focus._tick()
+        await pilot.pause(0)
+        band = focus.query_one(LogBand)
+        assert "cloning the real captive portal" in _log_text(band)
+
+        camp.fetching_real_portal = False
+        camp.cloned_real_portal = True
+        camp.portal_fetch_status = "fetched from the gateway (868 bytes)"
+        focus._tick()
+        focus._tick()                          # a second tick must not double-log
+        await pilot.pause(0)
+
+        text = _log_text(band)
+        assert text.count("fetched from the gateway (868 bytes)") == 1
+
+
+async def test_real_portal_clone_failure_logged_live_with_reason():
+    iface, array, ap = _open_target()
+    app = _Host(array, ap)
+    async with app.run_test(size=(120, 40)) as pilot:
+        await pilot.pause(0)
+        focus = app.screen
+        focus._tick_timer.stop()
+        focus._target_ap = ap
+        camp = _FakeEvilTwin(ap)
+        focus._eviltwin_attack = camp
+
+        camp.fetching_real_portal = True
+        focus._tick()
+        camp.fetching_real_portal = False
+        camp.cloned_real_portal = False
+        camp.portal_fetch_status = "no DHCP lease from the target"
+        focus._tick()
+        await pilot.pause(0)
+
+        band = focus.query_one(LogBand)
+        text = _log_text(band)
+        assert "no DHCP lease from the target" in text
+        assert "falling back to the template" in text
 
 
 async def test_multiple_submissions_each_logged_once():

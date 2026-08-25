@@ -104,6 +104,7 @@ class EvilTwinCampaign(Campaign):
         self._clone_real_portal = evil_input.clone_real_portal
         self.cloned_real_portal = False
         self.portal_fetch_error: Optional[str] = None
+        self.portal_fetch_status: Optional[str] = None   # always set once the fetch finishes
         self._fetched_page: Optional[str] = None
         self.fetching_real_portal = False   # True only while the fetch is actually in flight
         self.real_beacon = target.last_beacon_frame
@@ -129,14 +130,16 @@ class EvilTwinCampaign(Campaign):
         if self._should_clone_real_portal():
             self.fetching_real_portal = True
             try:
-                self._fetched_page = await fetch_real_portal(
+                result = await fetch_real_portal(
                     self.array, self.punt_iface, self.ap.bssid, self.ssid, self.target_channel)
             finally:
                 self.fetching_real_portal = False
-            if self._fetched_page is not None:
+            self._fetched_page = result.page
+            self.portal_fetch_status = result.status
+            if result.page is not None:
                 self.cloned_real_portal = True
             else:
-                self.portal_fetch_error = "couldn't clone the real portal; using the template instead"
+                self.portal_fetch_error = result.status
         self.fakeap = FakeAP(self.twin_iface, str_to_mac(self.twin_bssid), self.ssid,
                              self.twin_channel, self.twin_beacon, rx_source=self.twin_iface,
                              record_m1=self.array.record_injected_eapol, secured=self.secured,

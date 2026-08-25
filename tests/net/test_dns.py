@@ -1,9 +1,9 @@
 """Pure-protocol tests for the wildcard DNS encode/parse (no real socket), plus DnsServer's
 authorized-client forwarding path (sockets mocked out)."""
 import struct
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, mock_open, patch
 
-from wifit3.net.dns import DnsServer, build_reply
+from wifit3.net.dns import DnsServer, build_reply, system_resolver
 
 _ID = b"\x12\x34"
 
@@ -44,6 +44,37 @@ def test_reply_preserves_transaction_id_and_question():
     assert reply[0:2] == q[0:2]
     # Question section (after the 12-byte header) must be echoed back unmodified.
     assert reply[12:12 + len(q) - 12] == q[12:]
+
+
+# ----- system_resolver: piggyback on the host's own configured DNS server, not a hardcoded
+# public one -- that can be slow or firewalled on networks that only allow the DHCP-assigned
+# resolver out, while the host's own resolver is guaranteed reachable -----------------------
+
+def test_system_resolver_reads_first_nameserver():
+    conf = "# generated\nnameserver 192.168.1.1\nnameserver 8.8.8.8\n"
+    with patch("builtins.open", mock_open(read_data=conf)):
+        assert system_resolver() == "192.168.1.1"
+
+
+def test_system_resolver_falls_back_when_resolv_conf_missing():
+    with patch("builtins.open", side_effect=OSError):
+        assert system_resolver() == "1.1.1.1"
+
+
+def test_system_resolver_falls_back_when_no_nameserver_line():
+    with patch("builtins.open", mock_open(read_data="# empty\nsearch example.com\n")):
+        assert system_resolver() == "1.1.1.1"
+
+
+def test_dns_server_defaults_upstream_to_system_resolver():
+    with patch("wifit3.net.dns.system_resolver", return_value="192.168.1.1"):
+        srv = DnsServer("wifit3tap0", answer_ip="10.13.37.1")
+    assert srv.upstream == "192.168.1.1"
+
+
+def test_dns_server_explicit_upstream_overrides_system_resolver():
+    srv = DnsServer("wifit3tap0", answer_ip="10.13.37.1", upstream="9.9.9.9")
+    assert srv.upstream == "9.9.9.9"
 
 
 # ----- DnsServer: authorized clients get forwarded to a real resolver instead of wildcarded,
