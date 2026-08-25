@@ -76,7 +76,7 @@ async def test_fetch_returns_page_on_full_success(mocker):
 
     assert result.page == "<html>portal</html>"
     assert "gateway" in result.status
-    bridge.tap.add_address.assert_called_once_with("10.0.0.5", 24)
+    bridge.tap.add_address.assert_called_once_with("10.0.0.5", 24, gateway="10.0.0.1")
     bridge.start.assert_called_once()
     bridge.stop.assert_called_once()
 

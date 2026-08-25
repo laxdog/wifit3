@@ -85,10 +85,16 @@ class TapDevice:
             _run(self.name, "addr", "add", f"{ip}/{prefix}", "dev", self.name)
         _run(self.name, "link", "set", "dev", self.name, "up")
 
-    def add_address(self, ip: str, prefix: int = 24) -> None:
-        """Client role: assign the address DHCP just leased us. Deliberately no default route:
-        the fetch only ever talks to the target's own gateway, on the connected subnet."""
+    def add_address(self, ip: str, prefix: int = 24, gateway: Optional[str] = None) -> None:
+        """Client role: assign the DHCP-leased address; ``gateway`` also adds a low-priority
+        default route (else anything off-subnet fails EHOSTUNREACH before leaving the machine)."""
         _run(self.name, "addr", "add", f"{ip}/{prefix}", "dev", self.name)
+        if gateway is not None:
+            # metric 20000: never preferred over the host's own real default route for ordinary
+            # traffic -- only a socket explicitly SO_BINDTODEVICE-scoped to this TAP (every
+            # socket the fetch opens) has its route lookup restricted to this device at all.
+            _run(self.name, "route", "add", "default", "via", gateway, "dev", self.name,
+                "metric", "20000")
 
     def close(self) -> None:
         self.stop_reading()

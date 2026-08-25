@@ -115,7 +115,7 @@ async def _associate_and_fetch(iface, bssid_bytes: bytes, bssid: str, ssid: str,
                 return FetchResult(None, status)
             logger.info("eviltwin: real-portal fetch: got lease %s via %s, fetching the portal",
                        lease.ip, lease.router)
-            bridge.tap.add_address(lease.ip, lease.prefix)
+            bridge.tap.add_address(lease.ip, lease.prefix, gateway=lease.router)
             return await _fetch_page(lease)
         finally:
             bridge.stop()
