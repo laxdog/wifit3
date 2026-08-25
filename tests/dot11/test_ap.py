@@ -3,7 +3,7 @@ import struct
 
 import pytest
 
-from wifit3.dot11.ap import auth_resp, assoc_resp, eapol_m1, beacon_clone
+from wifit3.dot11.ap import auth_resp, assoc_resp, eapol_m1, beacon_clone, open_beacon
 from wifit3.dot11.eapol import (
     data_header, eapol_key, set_mic, LLC_SNAP_EAPOL, MIC_OFFSET, MIC_LEN, NONCE_LEN,
 )
@@ -87,6 +87,16 @@ def test_beacon_clone_secured_default_keeps_privacy_bit():
 def test_beacon_clone_rejects_short_beacon():
     with pytest.raises(ValueError):
         beacon_clone(bytes(20), 1)
+
+
+def test_open_beacon_is_broadcast_ess_only_no_rsn():
+    f = open_beacon(_BSSID, "FreeWifi", 6)
+    assert f[0:2] == b"\x80\x00"                      # beacon
+    assert f[4:10] == b"\xff\xff\xff\xff\xff\xff"     # addr1 broadcast
+    assert f[10:16] == _BSSID and f[16:22] == _BSSID
+    assert struct.unpack_from("<H", f, 34)[0] == 0x0001   # ESS only, no Privacy
+    assert ssid_ie("FreeWifi") in f
+    assert ds_param_ie(6) in f
 
 
 def test_data_header_direction():

