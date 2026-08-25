@@ -32,11 +32,17 @@ async def fetch_portal_page(tap_name: str, gateway_ip: str, *, dns_ip: Optional[
     for _ in range(_MAX_REDIRECTS):
         status, headers, body = await _get(tap_name, host, port, path, timeout, dns_ip=dns_ip)
         if status is None:
+            logger.info("portal_http_client: %s:%d%s: no response (connect/request failed)",
+                       host, port, path)
             return None
         if status in (301, 302, 303, 307, 308) and "location" in headers:
             nxt = urlsplit(headers["location"])
             if nxt.scheme not in ("", "http"):   # https: can't intercept it, not chasing it
+                logger.info("portal_http_client: %s:%d%s -> %d redirect to %s (https, not "
+                           "chasing it)", host, port, path, status, headers["location"])
                 return None
+            logger.info("portal_http_client: %s:%d%s -> %d redirect to %s",
+                       host, port, path, status, headers["location"])
             host = nxt.hostname or host
             # A splash server commonly redirects to its own non-80 listening port (nodogsplash's
             # default GatewayPort is 2050) -- any port is fine as long as it's still plain HTTP;
@@ -45,7 +51,13 @@ async def fetch_portal_page(tap_name: str, gateway_ip: str, *, dns_ip: Optional[
             port = nxt.port or 80
             path = (nxt.path or "/") + (f"?{nxt.query}" if nxt.query else "")
             continue
-        return body if status == 200 and body else None
+        if status == 200 and body:
+            logger.info("portal_http_client: %s:%d%s -> 200, %d bytes", host, port, path, len(body))
+            return body
+        logger.info("portal_http_client: %s:%d%s -> %d, body=%d bytes (not usable)",
+                   host, port, path, status, len(body or ""))
+        return None
+    logger.info("portal_http_client: gave up after %d redirects", _MAX_REDIRECTS)
     return None
 
 
@@ -55,6 +67,7 @@ async def _get(tap_name: str, host: str, port: int, path: str, timeout: float, *
     integration) + the actual request, which ``_request`` below does and IS unit-tested."""
     connect_ip = host if _is_ipv4(host) else await _resolve_host(tap_name, host, dns_ip, timeout)
     if connect_ip is None:
+        logger.info("portal_http_client: couldn't resolve %s", host)
         return None, {}, None
     loop = asyncio.get_running_loop()
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -62,7 +75,13 @@ async def _get(tap_name: str, host: str, port: int, path: str, timeout: float, *
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_BINDTODEVICE, tap_name.encode("ascii") + b"\x00")
         sock.setblocking(False)
         await asyncio.wait_for(loop.sock_connect(sock, (connect_ip, port)), timeout)
-    except (OSError, asyncio.TimeoutError):
+    except asyncio.TimeoutError:
+        logger.info("portal_http_client: connect to %s:%d timed out after %.1fs",
+                   connect_ip, port, timeout)
+        sock.close()
+        return None, {}, None
+    except OSError as exc:
+        logger.info("portal_http_client: connect to %s:%d failed: %s", connect_ip, port, exc)
         sock.close()
         return None, {}, None
     reader, writer = await asyncio.open_connection(sock=sock)
@@ -89,10 +108,12 @@ async def _request(reader: asyncio.StreamReader, writer: asyncio.StreamWriter, h
         await writer.drain()
         status, headers = await _read_head(reader, timeout)
         if status is None:
+            logger.info("portal_http_client: %s: response had no parseable status line", host)
             return None, {}, None
         body = await _read_body(reader, headers, timeout)
         return status, headers, body
-    except (OSError, asyncio.TimeoutError, asyncio.IncompleteReadError):
+    except (OSError, asyncio.TimeoutError, asyncio.IncompleteReadError) as exc:
+        logger.info("portal_http_client: %s: request/response failed: %s", host, exc)
         return None, {}, None
     finally:
         writer.close()

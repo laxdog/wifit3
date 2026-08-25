@@ -33,7 +33,9 @@ _ASSOC_ATTEMPTS = 2
 # than a wired DHCP client would need to.
 _DHCP_TIMEOUT = 10.0
 _DHCP_RETRIES = 5
-_HTTP_TIMEOUT = 5.0
+# A lightweight embedded router's splash server can be slow to respond, especially mid-redirect;
+# 5s was too tight for that in practice. _OVERALL_TIMEOUT below is the real backstop regardless.
+_HTTP_TIMEOUT = 8.0
 # Must comfortably exceed the sum of everything it wraps, or a real (imperfect-RF, slightly slow)
 # target gets cut off by this watchdog before finishing, even though every step would eventually
 # succeed on its own: worst case is ~10s assoc + ~20s DHCP (DISCOVER + REQUEST phases, each up to
