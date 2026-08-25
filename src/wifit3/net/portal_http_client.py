@@ -35,9 +35,14 @@ async def fetch_portal_page(tap_name: str, gateway_ip: str, *, dns_ip: Optional[
             return None
         if status in (301, 302, 303, 307, 308) and "location" in headers:
             nxt = urlsplit(headers["location"])
-            if nxt.port and nxt.port != 80:      # HTTPS or a non-portal redirect: not chasing it
+            if nxt.scheme not in ("", "http"):   # https: can't intercept it, not chasing it
                 return None
             host = nxt.hostname or host
+            # A splash server commonly redirects to its own non-80 listening port (nodogsplash's
+            # default GatewayPort is 2050) -- any port is fine as long as it's still plain HTTP;
+            # rejecting non-80 here was the actual bug behind "gateway ... failed" against a real
+            # nodogsplash portal, not an HTTPS-only one as the guessed status message assumed.
+            port = nxt.port or 80
             path = (nxt.path or "/") + (f"?{nxt.query}" if nxt.query else "")
             continue
         return body if status == 200 and body else None

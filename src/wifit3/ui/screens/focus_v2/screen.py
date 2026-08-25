@@ -142,6 +142,7 @@ class FocusViewV2(Screen):
         Binding("s", "silence", "Silence", show=True),
         Binding("s", "unsilence", "unSilence", show=True),
         Binding("q", "app.quit", "Quit", show=True),
+        Binding("y", "copy_log", "Copy log", show=True),
     ]
 
     _DEAUTH_SEL_ROUNDS = 10
@@ -711,6 +712,13 @@ class FocusViewV2(Screen):
         else:
             self._log("[bold]WPS PushButton Extraction[/bold] "
                       "[yellow]disabled[/yellow] [dim](detect only, press w to toggle)[/dim]")
+
+    def action_copy_log(self) -> None:
+        """'y': a terminal app can't offer native text selection, so put the whole log on the
+        system clipboard instead (OSC 52 -- works over SSH too, in terminals that support it)."""
+        text = self.query_one("#log", LogBand).get_text()
+        self.app.copy_to_clipboard(text)
+        self.notify("Log copied to clipboard", timeout=2)
 
     def action_silence(self) -> None:
         self._toggle_silence()

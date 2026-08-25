@@ -28,3 +28,8 @@ class LogBand(Vertical):
 
     def clear(self) -> None:
         self.query_one("#log-rich", RichLog).clear()
+
+    def get_text(self) -> str:
+        """Every visible line, plain text (Rich markup/styling stripped): what 'copy the log'
+        should put on the clipboard, since a terminal app can't offer native text selection."""
+        return "\n".join(strip.text for strip in self.query_one("#log-rich", RichLog).lines)

@@ -350,3 +350,18 @@ async def test_focus_pbc_autocapture_gated_on_flag(focus_host, tmp_path, monkeyp
     app.pbc_enabled = True
     focus._tick()
     assert started == [ap]           # enabled → auto-invade fires
+
+
+# ----- copy log ('y') --------------------------------------------------------
+
+@pytest.mark.asyncio(loop_scope="module")
+async def test_y_copies_the_log_to_the_clipboard(focus_host, monkeypatch):
+    app, focus, pilot = focus_host
+    copied = []
+    monkeypatch.setattr(app, "copy_to_clipboard", copied.append)
+    focus._log("a distinctive log line xyz123")
+
+    focus.action_copy_log()
+
+    assert len(copied) == 1
+    assert "a distinctive log line xyz123" in copied[0]

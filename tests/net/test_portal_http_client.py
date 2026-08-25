@@ -111,6 +111,40 @@ async def test_fetch_does_not_chase_an_https_redirect(mocker):
     assert result is None
 
 
+async def test_fetch_chases_a_same_scheme_redirect_to_a_non_80_port(mocker):
+    """nodogsplash's default GatewayPort is 2050: a plain-HTTP redirect to a non-80 port must
+    still be followed, connecting to THAT port -- rejecting any non-80 port here (mistaking it
+    for HTTPS) was a real bug that broke real nodogsplash portals."""
+    calls = []
+
+    async def fake_get(tap_name, host, port, path, timeout, *, dns_ip=None):
+        calls.append((host, port, path))
+        if len(calls) == 1:
+            return 302, {"location": "http://10.0.0.1:2050/splash"}, None
+        return 200, {}, _PORTAL_HTML
+
+    mocker.patch.object(phc, "_get", fake_get)
+    result = await phc.fetch_portal_page("wifit3fetch0", "10.0.0.1")
+    assert result == _PORTAL_HTML
+    assert calls[1] == ("10.0.0.1", 2050, "/splash")
+
+
+async def test_fetch_chases_a_schemeless_redirect_to_a_non_80_port(mocker):
+    """A protocol-relative Location (e.g. "//10.0.0.1:2050/splash", no scheme) is still HTTP."""
+    calls = []
+
+    async def fake_get(tap_name, host, port, path, timeout, *, dns_ip=None):
+        calls.append((host, port, path))
+        if len(calls) == 1:
+            return 302, {"location": "//10.0.0.1:2050/splash"}, None
+        return 200, {}, _PORTAL_HTML
+
+    mocker.patch.object(phc, "_get", fake_get)
+    result = await phc.fetch_portal_page("wifit3fetch0", "10.0.0.1")
+    assert result == _PORTAL_HTML
+    assert calls[1] == ("10.0.0.1", 2050, "/splash")
+
+
 async def test_fetch_returns_none_when_connection_fails(mocker):
     mocker.patch.object(phc, "_get", mocker.AsyncMock(return_value=(None, {}, None)))
     assert await phc.fetch_portal_page("wifit3fetch0", "10.0.0.1") is None
