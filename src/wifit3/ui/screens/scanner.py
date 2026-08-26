@@ -1,6 +1,7 @@
 import asyncio
 import time
 from pathlib import Path
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Dict, List, Optional
 
 from textual.app import ComposeResult, RenderResult
@@ -16,13 +17,15 @@ from rich.style import Style
 from rich.text import Span, Text
 
 from wifit3.campaigns import treelog
+from wifit3.campaigns.karma import KarmaCampaign
 from wifit3.campaigns.pbc import PbcWatcher, WpsPbcCapture
 from wifit3.campaigns.wps.registrar import PinResult
 from wifit3.persist.capture_history import load_capture_index, summarize
 from wifit3.persist.config import Config
 from wifit3.models import AccessPoint, PersistedCapture
-from wifit3.persist.save import save_handshake, save_pmkid, save_wps_pbc
+from wifit3.persist.save import save_handshake, save_pmkid, save_portal_credentials, save_wps_pbc
 from wifit3.crack.handshake import pmkid_crackable
+from wifit3.dot11.mac import mac_to_str
 
 from ..capture_events import (
     CAPTURE_TOAST_TITLES, DECLOAK_METHOD_LABELS, CaptureEvent, CaptureEventDetector, CaptureKind,
@@ -32,6 +35,8 @@ from wifit3.wlan.channels import band_ranges
 
 from .channel_filter import ChannelFilterDialog
 from .filter import FilterBar, ScanFilter
+from .focus_v2.art import display_name
+from .karma_modal import KarmaInput, KarmaInputModal
 
 if TYPE_CHECKING:
     from wifit3.ui.app import WifiteApp
@@ -217,6 +222,7 @@ class ScannerView(Screen):
         Binding("f", "focus_filter", "Filter", show=True),
         Binding("l", "toggle_log", "Toggle Log", show=True),
         Binding("w", "wps_pbc_mode", "WPS PBC", show=True),
+        Binding("k", "karma_mode", "Karma", show=True),
         Binding("home", "scroll_home", "Top", show=False, priority=True),
         Binding("end", "scroll_end", "Bottom", show=False, priority=True),
     ]
@@ -264,6 +270,14 @@ class ScannerView(Screen):
         # (app.pbc_enabled). Watcher + capturing serialization stay Scanner-local.
         self._pbc_watcher = PbcWatcher()
         self._pbc_capturing = False          # serialize: one invade at a time
+        # Karma mode: an opportunistic open-network responder, radio-owning like any Campaign
+        # (mutually exclusive with a per-AP attack via Campaign.active) but launched here, not
+        # from Focus, since it has no target AP.
+        self._karma_campaign: Optional[KarmaCampaign] = None
+        self._karma_timer = None
+        self._karma_ssids_logged = 0
+        self._karma_joined_logged = 0
+        self._karma_submissions_logged = 0
 
     # ----- Compose / mount ---------------------------------------------------
 
@@ -831,6 +845,103 @@ class ScannerView(Screen):
             if self.app.screen is self:
                 # Resume hopping only if we're still the foreground screen (not Focus).
                 await array.start_hopping(channels=self._channel_filter, interval=0.25)
+
+    # ----- Karma mode (opportunistic open-network responder) -----------------
+
+    def action_karma_mode(self) -> None:
+        if self._karma_campaign:
+            self._stop_karma()
+        else:
+            self._start_karma()
+
+    def _start_karma(self) -> None:
+        array = self.app.array
+        if not array or not array.members:
+            self._write_log("[red]✗ No interface. Cannot start Karma.[/red]")
+            return
+        self.app.push_screen(KarmaInputModal(array.members), self._on_karma_input)
+
+    def _on_karma_input(self, result: Optional[KarmaInput]) -> None:
+        if result is None:
+            return
+        array = self.app.array
+        if not array:
+            return
+        asyncio.create_task(self._launch_karma(array, result))
+
+    async def _launch_karma(self, array, result: KarmaInput) -> None:
+        """No target AP means no per-attack channel to reconcile with the hopper: just pause it,
+        same as a PBC invade, for the duration of the run."""
+        await array.stop_hopping()
+        camp = KarmaCampaign(array, result.iface, result.channel,
+                             portal_template=result.portal_template)
+        if not camp.run():
+            self._write_log("[red]✗ Another attack already owns the radio.[/red]")
+            if self.app.screen is self:
+                await array.start_hopping(channels=self._channel_filter, interval=0.25)
+            return
+        self._karma_campaign = camp
+        self._karma_ssids_logged = 0
+        self._karma_joined_logged = 0
+        self._karma_submissions_logged = 0
+        self._karma_timer = self.set_interval(1.0, self._poll_karma)
+        self._write_log(treelog.header(
+            f"[bold]Karma Mode[/bold] is [bold green]active[/bold green] on "
+            f"[bold]{escape(display_name(result.iface))}[/bold] ch {result.channel} "
+            f"[dim](press [bold]k[/bold] to stop)[/dim]", color="green"))
+        self._write_log(treelog.leaf(
+            "[dim]answering any client's saved open network with a matching twin…[/dim]"))
+
+    def _stop_karma(self) -> None:
+        camp = self._karma_campaign
+        if not camp:
+            return
+        self._karma_campaign = None
+        if self._karma_timer:
+            self._karma_timer.stop()
+            self._karma_timer = None
+        camp.request_stop()
+        self._write_log("[bright_red bold]Karma Mode stopped[/]")
+        array = self.app.array
+        if array and self.app.screen is self:
+            asyncio.create_task(array.start_hopping(channels=self._channel_filter, interval=0.25))
+
+    def _poll_karma(self) -> None:
+        """Log + persist live, same rationale as ``_poll_eviltwin_live_events``: Karma may run
+        indefinitely, so waiting for the run to end would mean often never seeing this at all."""
+        camp = self._karma_campaign
+        if not camp or self.app.screen is not self:
+            return
+        if camp.karma is not None:
+            seen = camp.karma.stats.ssids_seen
+            for ssid in seen[self._karma_ssids_logged:]:
+                self._write_log(treelog.branch(f"[cyan]probed for[/cyan] \"{escape(ssid)}\""))
+            self._karma_ssids_logged = len(seen)
+        for entry in camp.joined_clients[self._karma_joined_logged:]:
+            self._write_log(treelog.branch_ok(
+                f"[bold green]client joined[/bold green] {escape(entry['mac'])} as "
+                f"\"{escape(entry['ssid'])}\""))
+        self._karma_joined_logged = len(camp.joined_clients)
+        for fields in camp.portal_submissions[self._karma_submissions_logged:]:
+            self._karma_submissions_logged += 1
+            shown = ", ".join(f"{k}={v}" for k, v in fields.items())
+            self._write_log(treelog.leaf(
+                f"[black bold on green] portal credentials [/black bold on green] {escape(shown)}"))
+            self._save_karma_credentials(camp, fields)
+
+    def _save_karma_credentials(self, camp: KarmaCampaign, fields: dict) -> None:
+        """No single real SSID applies (every joiner may believe a different name), so this
+        saves under a generic "Karma" label rather than eviltwin's per-target file naming."""
+        if camp.karma is None or camp.karma.bssid is None:
+            return
+        try:
+            fake_ap = SimpleNamespace(ssid="Karma", bssid=mac_to_str(camp.karma.bssid))
+            result = save_portal_credentials(fake_ap, fields)
+            if result is not None:
+                verb = "saved" if result.was_new else "already saved as"
+                self._write_log(treelog.leaf(f"[cyan]{verb}[/cyan] [dim]{escape(result.path.name)}[/dim]"))
+        except Exception:
+            self._write_log(treelog.leaf("[dim](portal credentials not saved to disk)[/dim]"))
 
     def action_focus_filter(self) -> None:
         self.query_one(FilterBar).focus_text()
