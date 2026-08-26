@@ -1,17 +1,18 @@
-"""KarmaInputModal: pick the interface/channel/portal page before Karma mode starts. Unlike
-``EvilTwinInputModal`` there is no target AP to derive anything from -- Karma answers whatever
-SSID a nearby client asks for, so the only choices are which radio hosts it and which channel it
-sits on.
+"""KarmaInputModal: pick which cards host Karma, each on its own channel, and the portal page.
+Unlike ``EvilTwinInputModal`` there is no target AP to derive anything from -- Karma answers
+whatever SSID a nearby client asks for, so the only choices are which radios take part (one per
+channel: a client's probe only reaches Karma if it's on the channel Karma is actually sitting on)
+and which page joiners see.
 """
 from __future__ import annotations
 
-from typing import List, NamedTuple, Optional
+from typing import List, NamedTuple, Optional, Tuple
 
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
 from textual.screen import ModalScreen
-from textual.widgets import Button, Label, Select
+from textual.widgets import Button, Checkbox, Label, Select
 
 from wifit3.chips.driver import FakeMacSupport
 from wifit3.wlan.array import fake_mac_rank
@@ -25,32 +26,56 @@ _PORTAL_TEMPLATES = [("Click-through / terms agreement", PortalTemplate.CLICKTHR
                      ("Phone number", PortalTemplate.PHONE.value),
                      ("Hotel room + last name", PortalTemplate.ROOM.value)]
 
+# Preference order for auto-assigning distinct channels across the checked cards: the
+# non-overlapping 2.4GHz trio first (where most saved-network probing happens), then the rest.
+_PREFERRED_CHANNELS = [1, 6, 11, 2, 3, 4, 5, 7, 8, 9, 10, 12, 13, 36, 40, 44, 48, 149, 153, 157, 161]
+
 
 def _can_host(iface) -> bool:
     return getattr(getattr(iface, "driver", None), "FAKE_MAC", None) in (
         FakeMacSupport.SPOOFABLE, FakeMacSupport.FIXED_MAC)
 
 
+def _default_channels(hosts: List) -> List[int]:
+    """One distinct channel per host where possible; a host only repeats a channel already given
+    to another host when it has no unused channel of its own left to try."""
+    used: set = set()
+    out: List[int] = []
+    for host in hosts:
+        supported = host.supported_channels or [1]
+        pick = next((c for c in _PREFERRED_CHANNELS if c in supported and c not in used), None)
+        if pick is None:
+            pick = next((c for c in supported if c not in used), None)
+        if pick is None:
+            pick = supported[0]
+        used.add(pick)
+        out.append(pick)
+    return out
+
+
 class KarmaInput(NamedTuple):
-    iface: object
-    channel: int
+    hosts: Tuple[Tuple[object, int], ...]     # ((iface, channel), ...), at least one
     portal_template: PortalTemplate
 
 
 class KarmaInputModal(ModalScreen[Optional[KarmaInput]]):
-    """Pick the interface, channel, and portal page before Karma mode starts."""
+    """Pick which cards host Karma (each its own channel) and the portal page."""
 
     BINDINGS = [Binding("escape", "cancel", "Cancel", show=True)]
 
     DEFAULT_CSS = """
     KarmaInputModal { align: center middle; }
     KarmaInputModal #dialog {
-        width: 56; height: auto; border: thick $primary; background: $surface; padding: 1 2;
+        width: 56; height: auto; max-height: 90%; border: thick $primary; background: $surface; padding: 1 2;
     }
     KarmaInputModal #title { width: 1fr; content-align: center middle; margin-bottom: 1; text-style: bold; }
     KarmaInputModal .row { height: auto; margin-bottom: 0; }
     KarmaInputModal .row-label { width: 18; height: 3; content-align: left middle; color: $text-muted; }
     KarmaInputModal .row Select { width: 1fr; }
+    KarmaInputModal .card-row { height: 3; }
+    KarmaInputModal .card-row Checkbox { width: 1fr; border: none; }
+    KarmaInputModal .card-row Select { width: 12; }
+    KarmaInputModal #warn { color: $text-warning; content-align: center middle; height: auto; display: none; }
     KarmaInputModal #button-row { height: auto; align: center middle; margin-top: 1; }
     KarmaInputModal #button-row Button { margin: 0 1; }
     """
@@ -58,50 +83,55 @@ class KarmaInputModal(ModalScreen[Optional[KarmaInput]]):
     def __init__(self, members: List) -> None:
         super().__init__()
         self._hosts = sorted((m for m in members if _can_host(m)), key=fake_mac_rank)
+        self._defaults = _default_channels(self._hosts)
 
     def compose(self) -> ComposeResult:
-        iface = self._hosts[0] if self._hosts else None
         with Vertical(id="dialog"):
             yield Label("Karma Mode", id="title")
-            with Horizontal(classes="row"):
-                yield Label("Interface", classes="row-label")
-                yield Select([(display_name(m), m.name) for m in self._hosts],
-                             value=iface.name if iface else Select.BLANK,
-                             allow_blank=False, id="karma-iface")
-            with Horizontal(classes="row"):
-                yield Label("Channel", classes="row-label")
-                yield Select(self._channel_options(iface), value=self._default_channel(iface),
-                             allow_blank=False, id="karma-channel")
+            with Vertical(id="card-rows"):
+                for i, iface in enumerate(self._hosts):
+                    with Horizontal(classes="row card-row"):
+                        yield Checkbox(display_name(iface), value=True, id=f"card-{i}")
+                        yield Select(self._channel_options(iface), value=self._defaults[i],
+                                     allow_blank=False, id=f"channel-{i}")
             with Horizontal(classes="row"):
                 yield Label("Portal page", classes="row-label")
                 yield Select(_PORTAL_TEMPLATES, value=PortalTemplate.CLICKTHROUGH.value,
                              allow_blank=False, id="portal-template")
+            yield Label("", id="warn")
             with Horizontal(id="button-row"):
                 yield Button("Start Karma", variant="primary", id="btn-start")
                 yield Button("Cancel", variant="default", id="btn-cancel")
 
+    def on_mount(self) -> None:
+        self._sync_warning()
+
     # ----- interface / channel wiring ---------------------------------------
 
     def _channel_options(self, iface) -> List:
-        chans = iface.supported_channels if iface else [1]
-        return [(str(c), c) for c in chans]
+        return [(str(c), c) for c in (iface.supported_channels or [1])]
 
-    def _default_channel(self, iface) -> int:
-        chans = iface.supported_channels if iface else [1]
-        if iface is not None and iface.current_channel in chans:
-            return iface.current_channel
-        return chans[0]
+    def _checked_hosts(self) -> List[Tuple[object, int]]:
+        out = []
+        for i, iface in enumerate(self._hosts):
+            if self.query_one(f"#card-{i}", Checkbox).value:
+                channel = self.query_one(f"#channel-{i}", Select).value
+                out.append((iface, channel))
+        return out
 
-    def _by_name(self, name) -> Optional[object]:
-        return next((m for m in self._hosts if m.name == name), None)
+    def on_checkbox_changed(self, event: Checkbox.Changed) -> None:
+        self._sync_warning()
 
-    def on_select_changed(self, event: Select.Changed) -> None:
-        if event.select.id != "karma-iface":
-            return
-        iface = self._by_name(event.value)
-        channel = self.query_one("#karma-channel", Select)
-        channel.set_options(self._channel_options(iface))
-        channel.value = self._default_channel(iface)
+    def _sync_warning(self) -> None:
+        if not self._checked_hosts():
+            self._set_warn("Pick at least one card")
+        else:
+            self._set_warn("")
+
+    def _set_warn(self, text: str) -> None:
+        warn = self.query_one("#warn", Label)
+        warn.update(text)
+        warn.display = bool(text)
 
     # ----- buttons -------------------------------------------------------------
 
@@ -115,9 +145,9 @@ class KarmaInputModal(ModalScreen[Optional[KarmaInput]]):
         self.dismiss(None)
 
     def _start(self) -> None:
-        iface = self._by_name(self.query_one("#karma-iface", Select).value)
-        if iface is None:
+        hosts = self._checked_hosts()
+        if not hosts:
+            self._sync_warning()
             return
-        channel = self.query_one("#karma-channel", Select).value
         template = PortalTemplate(self.query_one("#portal-template", Select).value)
-        self.dismiss(KarmaInput(iface=iface, channel=channel, portal_template=template))
+        self.dismiss(KarmaInput(hosts=tuple(hosts), portal_template=template))

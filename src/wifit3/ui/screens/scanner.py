@@ -275,7 +275,7 @@ class ScannerView(Screen):
         # from Focus, since it has no target AP.
         self._karma_campaign: Optional[KarmaCampaign] = None
         self._karma_timer = None
-        self._karma_ssids_logged = 0
+        self._karma_ssids_logged: set = set()
         self._karma_joined_logged = 0
         self._karma_submissions_logged = 0
 
@@ -870,25 +870,24 @@ class ScannerView(Screen):
         asyncio.create_task(self._launch_karma(array, result))
 
     async def _launch_karma(self, array, result: KarmaInput) -> None:
-        """No target AP means no per-attack channel to reconcile with the hopper: just pause it,
-        same as a PBC invade, for the duration of the run."""
-        await array.stop_hopping()
-        camp = KarmaCampaign(array, result.iface, result.channel,
-                             portal_template=result.portal_template)
+        """No target AP means no per-attack channel to reconcile with the hopper: pause only the
+        cards Karma is about to use (same as a PBC invade); any unchecked card keeps scanning."""
+        for iface, _ in result.hosts:
+            await iface.stop_hopping()
+        camp = KarmaCampaign(None, result.hosts, portal_template=result.portal_template)
         if not camp.run():
             self._write_log("[red]✗ Another attack already owns the radio.[/red]")
-            if self.app.screen is self:
-                await array.start_hopping(channels=self._channel_filter, interval=0.25)
+            await self._resume_karma_hosts(result.hosts)
             return
         self._karma_campaign = camp
-        self._karma_ssids_logged = 0
+        self._karma_ssids_logged = set()
         self._karma_joined_logged = 0
         self._karma_submissions_logged = 0
         self._karma_timer = self.set_interval(1.0, self._poll_karma)
+        card_list = ", ".join(f"{escape(display_name(i))} ch {c}" for i, c in result.hosts)
         self._write_log(treelog.header(
             f"[bold]Karma Mode[/bold] is [bold green]active[/bold green] on "
-            f"[bold]{escape(display_name(result.iface))}[/bold] ch {result.channel} "
-            f"[dim](press [bold]k[/bold] to stop)[/dim]", color="green"))
+            f"{card_list} [dim](press [bold]k[/bold] to stop)[/dim]", color="green"))
         self._write_log(treelog.leaf(
             "[dim]answering any client's saved open network with a matching twin…[/dim]"))
 
@@ -902,9 +901,15 @@ class ScannerView(Screen):
             self._karma_timer = None
         camp.request_stop()
         self._write_log("[bright_red bold]Karma Mode stopped[/]")
-        array = self.app.array
-        if array and self.app.screen is self:
-            asyncio.create_task(array.start_hopping(channels=self._channel_filter, interval=0.25))
+        if self.app.screen is self:
+            asyncio.create_task(self._resume_karma_hosts(camp.hosts))
+
+    async def _resume_karma_hosts(self, hosts) -> None:
+        for iface, _ in hosts:
+            try:
+                await iface.start_hopping()
+            except Exception:
+                self._write_log(f"[dim](failed to resume hopping on {escape(display_name(iface))})[/dim]")
 
     def _poll_karma(self) -> None:
         """Log + persist live, same rationale as ``_poll_eviltwin_live_events``: Karma may run
@@ -912,11 +917,11 @@ class ScannerView(Screen):
         camp = self._karma_campaign
         if not camp or self.app.screen is not self:
             return
-        if camp.karma is not None:
-            seen = camp.karma.stats.ssids_seen
-            for ssid in seen[self._karma_ssids_logged:]:
-                self._write_log(treelog.branch(f"[cyan]probed for[/cyan] \"{escape(ssid)}\""))
-            self._karma_ssids_logged = len(seen)
+        for karma in camp.karmas:
+            for ssid in karma.stats.ssids_seen:
+                if ssid not in self._karma_ssids_logged:
+                    self._karma_ssids_logged.add(ssid)
+                    self._write_log(treelog.branch(f"[cyan]probed for[/cyan] \"{escape(ssid)}\""))
         for entry in camp.joined_clients[self._karma_joined_logged:]:
             self._write_log(treelog.branch_ok(
                 f"[bold green]client joined[/bold green] {escape(entry['mac'])} as "
@@ -932,10 +937,10 @@ class ScannerView(Screen):
     def _save_karma_credentials(self, camp: KarmaCampaign, fields: dict) -> None:
         """No single real SSID applies (every joiner may believe a different name), so this
         saves under a generic "Karma" label rather than eviltwin's per-target file naming."""
-        if camp.karma is None or camp.karma.bssid is None:
+        if not camp.karmas:
             return
         try:
-            fake_ap = SimpleNamespace(ssid="Karma", bssid=mac_to_str(camp.karma.bssid))
+            fake_ap = SimpleNamespace(ssid="Karma", bssid=mac_to_str(camp.karmas[0].bssid))
             result = save_portal_credentials(fake_ap, fields)
             if result is not None:
                 verb = "saved" if result.was_new else "already saved as"

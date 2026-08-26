@@ -1,9 +1,10 @@
-"""KarmaCampaign: drives ``KarmaAP`` on one operator-picked interface/channel and (Linux, best
-effort) captive-portals whoever joins, reusing EvilTwin's open-clone IP layer wholesale --
-``PortalStack`` only ever cared about a BSSID + an SSID string, never about *which* attack put a
-client on the TAP. Unlike ``EvilTwinCampaign`` there is no target ``AccessPoint`` at all (this is
-launched from the Scanner, not a per-AP Focus panel) and no punting: Karma is entirely passive,
-waiting for clients to volunteer themselves.
+"""KarmaCampaign: drives one KarmaAP per operator-picked (interface, channel) pair -- one radio
+per channel, since a client's directed probe only reaches Karma if it's on the channel Karma is
+actually sitting on -- and (Linux, best effort) captive-portals whoever joins any of them, via one
+shared KarmaBridge feeding EvilTwin's PortalStack. PortalStack only ever needed a bridge + an
+SSID, never caring which attack (or how many radios) put a client on the TAP. No target
+AccessPoint at all (launched from the Scanner, not a per-AP Focus panel) and no punting: Karma is
+entirely passive, waiting for clients to volunteer themselves.
 """
 from __future__ import annotations
 
@@ -11,10 +12,11 @@ import asyncio
 import logging
 import sys
 import time
-from typing import Optional
+from typing import List, Optional, Tuple
 
 from wifit3.campaigns.campaign import Campaign
 from wifit3.campaigns.eviltwin.portal import PortalStack
+from wifit3.campaigns.karma.bridge import KarmaBridge
 from wifit3.campaigns.karma.karma_ap import KarmaAP
 from wifit3.net.portal_templates import PortalTemplate
 
@@ -34,27 +36,24 @@ class KarmaCampaign(Campaign):
     idle_variant = "primary"
     run_variant = "error"
 
-    def __init__(self, array, iface, channel: int,
+    def __init__(self, array, hosts: List[Tuple[object, int]],
                  portal_template: PortalTemplate = PortalTemplate.CLICKTHROUGH):
+        if not hosts:
+            raise ValueError("KarmaCampaign needs at least one (interface, channel) pair")
         super().__init__(ap=None, array=array)
-        self._karma_iface = iface
-        self.channel = channel
+        self.hosts = list(hosts)                        # [(iface, channel), ...], operator-picked
         self.portal_template = portal_template
-        self.karma: Optional[KarmaAP] = None
+        self.karmas: List[KarmaAP] = []
         self.portal: Optional[PortalStack] = None
         self.ip_layer_error: Optional[str] = None
         self.portal_submissions: list[dict] = []       # harvested form submissions, newest last
         self.joined_clients: list[dict] = []            # {"mac", "ssid", "at"}, newest last
 
-    @property
-    def iface(self):
-        """Explicitly operator-picked (there's no target AP to ``select_iface`` off of)."""
-        return self._karma_iface
-
     async def _loop(self) -> None:
-        self.karma = KarmaAP(self._karma_iface, self.channel, rx_source=self._karma_iface,
-                             on_client_joined=self._on_client_joined)
-        await self.karma.start()
+        self.karmas = [KarmaAP(iface, channel, rx_source=iface, on_client_joined=self._on_client_joined)
+                       for iface, channel in self.hosts]
+        for k in self.karmas:
+            await k.start()
         await self._start_ip_layer()
         while not self.stopped:
             await asyncio.sleep(_POLL_SEC)
@@ -68,8 +67,9 @@ class KarmaCampaign(Campaign):
         if not sys.platform.startswith("linux"):
             self.ip_layer_error = "no IP layer yet on this platform (Linux only for now)"
             return
-        stack = PortalStack(self._karma_iface, self.karma.bssid, GENERIC_PORTAL_SSID,
-                            template=self.portal_template, on_submit=self.portal_submissions.append)
+        bridge = KarmaBridge([(k.iface, k.bssid) for k in self.karmas])
+        stack = PortalStack(bridge=bridge, ssid=GENERIC_PORTAL_SSID, template=self.portal_template,
+                            on_submit=self.portal_submissions.append)
         try:
             await stack.start()
         except Exception as exc:                                    # noqa: BLE001
@@ -79,10 +79,11 @@ class KarmaCampaign(Campaign):
         self.portal = stack
 
     async def teardown(self) -> None:
-        if self.karma is None:
+        if not self.karmas:
             return
         try:
-            await self.karma.stop()
+            for k in self.karmas:
+                await k.stop()
         finally:
             if self.portal is not None:
                 await self.portal.stop()
