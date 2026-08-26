@@ -295,10 +295,43 @@ fetch now passes `privacy=False`, since it only ever targets a confirmed-open AP
 More portal templates: `VOUCHER` (access code), `PHONE` (number capture), `ROOM` (hotel room +
 surname), alongside the original `PASSWORD`/`LOGIN`/`CLICKTHROUGH`.
 
-**Considered, not built — Karma/MANA-style probe response.** Today's `FakeAP` only answers probes
-for the one specific target SSID (plus wildcard probes asking "what's nearby"). A Karma-style
-responder instead answers *any* directed probe with a matching AP, so a device with an open SSID
-in its saved-network list joins automatically without ever being near the real network. This is a
-materially different device (per-probed-SSID state, not one target) and a genuinely new attack
-mode, not a variant of the existing one — worth a class-design discussion before building, not an
-extension to slot into `FakeAP` unasked.
+## Karma: opportunistic open-network responder — DONE
+
+Shipped as a new sibling package, `campaigns/karma/` (`KarmaAP` + `KarmaCampaign`), per the
+class-design discussion this entry used to flag: a materially different device from `FakeAP`
+(no fixed target, per-probed-SSID state instead of one target), not a variant slotted into it.
+
+- `KarmaAP` (`karma_ap.py`) answers *any* client's directed probe request with an open twin of
+  the exact SSID asked for, banking on the client auto-joining a network it believes it already
+  knows. Every discovered SSID shares one BSSID: `set_fake_mac`'s active-monitor can only
+  HW-ACK one forged address at a time on this hardware, so distinct virtual networks are told
+  apart by name only (the same way any single-radio software AP fakes multiple SSIDs without
+  true multi-BSSID hardware). The beacon loop round-robins whichever SSIDs have been probed so
+  far. `dot11/ap.py:open_beacon` builds the from-scratch beacon (no real AP to clone from,
+  unlike `beacon_clone`).
+- **Open-only, by design.** A MANA-style WPA/PSK correlation attempt (standing up a *secured*
+  virtual AP per probed SSID, hoping a client's saved WPA2 network auto-joins and hands over a
+  crackable M2) was scoped out: modern OSes verify the security type before auto-joining, so
+  answering a WPA probe with an open twin rarely gets anywhere, and even a working MANA hit only
+  yields a crackable handshake — not the plaintext credential the open path gets via the
+  captive-portal harvest below. Roughly doubles the build for a low-yield case; a possible
+  follow-on, not v1.
+- `KarmaCampaign` has no target `AccessPoint` at all — launched from the **Scanner** screen
+  (hotkey `k`, `KarmaInputModal` picks interface/channel/portal page), not a per-AP Focus panel,
+  since there's no target to attach a Focus button to. Still a normal radio-owning `Campaign`
+  (mutex-exclusive with any other attack) and entirely passive: no punting, just waiting for
+  clients to volunteer themselves.
+- Reuses EvilTwin's `PortalStack` (bridge + DHCP + DNS + HTTP + NAT) wholesale for the IP layer
+  once a client joins — it only ever needed a BSSID and an SSID string, never caring which attack
+  put the client on the TAP. No per-SSID portal personalization in v1 (every joiner sees the same
+  generic page); harvested submissions save under a generic "Karma"-labeled pseudo-AP rather than
+  a real target's file naming, since no single real SSID applies to every joiner.
+
+**Verified on real hardware** (two AR9271s, no target AP or phone needed): one card hosting
+`KarmaAP`, the other injecting a directed probe request + auth + assoc as a forged client MAC for
+a made-up SSID — full probe→probe-response, auth→auth-response, assoc→assoc-response round trip,
+with `KarmaAP.stats` correctly tracking the client joining that SSID. **Not yet independently
+re-verified live for Karma specifically: the IP-layer / NAT reuse** (it's the same `PortalStack`/
+`NatGateway` code already verified end-to-end for EvilTwin's open clone, unmodified) and the
+actual auto-join behavior of a real client device against a saved open network (needs a real
+phone/laptop with a matching saved SSID in range, not reproducible solo).
