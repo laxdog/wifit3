@@ -330,8 +330,20 @@ class-design discussion this entry used to flag: a materially different device f
 **Verified on real hardware** (two AR9271s, no target AP or phone needed): one card hosting
 `KarmaAP`, the other injecting a directed probe request + auth + assoc as a forged client MAC for
 a made-up SSID — full probe→probe-response, auth→auth-response, assoc→assoc-response round trip,
-with `KarmaAP.stats` correctly tracking the client joining that SSID. **Not yet independently
-re-verified live for Karma specifically: the IP-layer / NAT reuse** (it's the same `PortalStack`/
-`NatGateway` code already verified end-to-end for EvilTwin's open clone, unmodified) and the
-actual auto-join behavior of a real client device against a saved open network (needs a real
-phone/laptop with a matching saved SSID in range, not reproducible solo).
+with `KarmaAP.stats` correctly tracking the client joining that SSID.
+
+**IP-layer / NAT reuse — verified live.** Ran `KarmaCampaign` for real with the full stack up
+(TAP + DHCP + DNS + HTTP + NAT) against the box's actual internet-connected interface, under a
+dead-man's-switch watchdog (a detached process, independent of the test itself, that would force-
+restore iptables after a timeout if anything hung): `internet_shared=True`, `nat_error=None`, and
+the resulting iptables rules were exactly the three expected ones, correctly scoped to
+`10.13.37.0/24`/`wifit3tap0`/the real uplink — nothing broader. The host's own internet connection
+kept working throughout, a synthetic client completed the full probe/auth/assoc join with the IP
+layer concurrently live, and teardown left iptables completely clean and the TAP gone. One
+pre-existing finding along the way: the box had stale `wifit3-nat`-tagged iptables rules left over
+from some earlier run whose teardown hadn't fully completed (the TAP itself was gone, so they were
+inert, but not clean) — removed before establishing the test's baseline.
+
+**Not yet independently re-verified: the actual auto-join behavior of a real client device**
+against a saved open network (needs a real phone/laptop with a matching saved SSID in range, not
+reproducible solo).
