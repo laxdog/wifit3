@@ -344,6 +344,28 @@ pre-existing finding along the way: the box had stale `wifit3-nat`-tagged iptabl
 from some earlier run whose teardown hadn't fully completed (the TAP itself was gone, so they were
 inert, but not clean) — removed before establishing the test's baseline.
 
+**Multi-radio (N cards, one channel each) — DONE.** A client's directed probe only reaches Karma
+if it's on the exact channel Karma is sitting on, so `KarmaCampaign` now takes a list of
+`(interface, channel)` pairs instead of one and owns one `KarmaAP` per radio. New:
+`campaigns/karma/bridge.py:KarmaBridge`, a MAC-learning bridge across every radio — each still
+gets its own independently-forged bssid, but there's still only one shared TAP/subnet/portal
+behind all of them, so a downlink reply has to go out on whichever specific radio that client
+actually associated through. `PortalStack` gained a small DI seam (an optional pre-built `bridge`
+param) so Karma can hand it a `KarmaBridge` instead of the default single-radio `IpBridge`;
+EvilTwin's own call sites are untouched. `KarmaInputModal` is a manual multi-select: checkbox +
+channel dropdown per available card, defaulting to the non-overlapping 2.4GHz trio (1/6/11)
+first. The Scanner only pauses the hopper on cards actually picked for Karma, not the whole array.
+
+**Verified on real hardware** (two AR9271s, one `KarmaAP` per card on channels 1 and 6, no target
+AP or phone needed): both radios came up with distinct bssids, the shared IP layer (TAP + DHCP +
+DNS + NAT) came up correctly across both via one `KarmaBridge`, iptables scoped exactly as
+expected, host connectivity unaffected throughout, and teardown left both radios and the IP layer
+completely clean. Run under the same dead-man's-switch watchdog as the single-radio NAT test.
+With only two physical cards available, this verifies the multi-radio *orchestration* and shared
+IP layer on real hardware; `KarmaBridge`'s per-client routing/flooding logic (which radio a reply
+goes out on) is covered by `tests/campaigns/test_karma_bridge.py` with fakes rather than a third
+physical radio playing a synthetic client.
+
 **Not yet independently re-verified: the actual auto-join behavior of a real client device**
 against a saved open network (needs a real phone/laptop with a matching saved SSID in range, not
 reproducible solo).
