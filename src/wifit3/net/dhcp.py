@@ -133,6 +133,9 @@ class DhcpServer:
         except PermissionError as exc:
             sock.close()
             raise TapPermissionError(SETCAP_HINT) from exc
+        except OSError:
+            sock.close()
+            raise
         sock.setblocking(False)
         self._sock = sock
         asyncio.get_running_loop().add_reader(sock.fileno(), self._on_readable)

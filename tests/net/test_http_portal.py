@@ -1,6 +1,8 @@
 """HttpPortalServer request handling, over a loopback socket (bypasses TAP/SO_BINDTODEVICE/
-privileged-port setup entirely: only ``_handle`` is under test, not ``start()``)."""
+privileged-port setup entirely: only ``_handle`` is under test, not ``start()``), plus a
+dedicated ``start()`` socket-teardown-on-failure test below."""
 import asyncio
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -43,6 +45,16 @@ async def test_get_check_path_redirects_to_root_when_unauthorized(server):
     resp = await _request(port, b"GET /hotspot-detect.html HTTP/1.1\r\nHost: x\r\n\r\n")
     assert resp.startswith(b"HTTP/1.1 302")
     assert b"Location: /" in resp
+    assert srv.submissions == []
+
+
+async def test_favicon_request_404s_without_authorizing(server):
+    """A real browser requests /favicon.ico on every navigation whether or not the page declares
+    one -- if that fell to the "real portal's own submit link" branch, it would silently
+    pre-authorize the client before they ever saw the form."""
+    srv, port = server
+    resp = await _request(port, b"GET /favicon.ico HTTP/1.1\r\nHost: x\r\n\r\n")
+    assert resp.startswith(b"HTTP/1.1 404")
     assert srv.submissions == []
 
 
@@ -227,6 +239,18 @@ async def test_referenced_but_unfetched_asset_404s_without_authorizing():
     finally:
         asyncio_server.close()
         await asyncio_server.wait_closed()
+
+
+async def test_start_closes_the_socket_on_a_non_permission_bind_failure():
+    """Only PermissionError used to close the socket before re-raising; any other bind failure
+    (e.g. EADDRINUSE from a leftover run) leaked the fd instead."""
+    srv = HttpPortalServer("wifit3tap0", page=_PAGE)
+    sock = MagicMock()
+    sock.bind.side_effect = OSError("Address already in use")
+    with patch("wifit3.net.http_portal.socket.socket", return_value=sock):
+        with pytest.raises(OSError):
+            await srv.start()
+    sock.close.assert_called_once()
 
 
 async def test_malformed_request_line_closes_without_crashing(server):

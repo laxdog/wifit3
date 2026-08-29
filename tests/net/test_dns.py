@@ -3,6 +3,8 @@ authorized-client forwarding path (sockets mocked out)."""
 import struct
 from unittest.mock import MagicMock, mock_open, patch
 
+import pytest
+
 from wifit3.net.dns import DnsServer, build_reply, system_resolver
 
 _ID = b"\x12\x34"
@@ -99,26 +101,43 @@ def test_unauthorized_client_gets_the_wildcard_answer():
     srv._upstream_sock.sendto.assert_not_called()
 
 
-def test_authorized_client_query_is_forwarded_upstream_not_wildcarded():
+def test_authorized_client_query_is_forwarded_upstream_with_a_locally_unique_id():
+    """The client's own transaction id is replaced with one we control before forwarding:
+    a second client picking the same 16-bit id must never collide with this one."""
     srv = _server(authorized={"10.13.37.100"})
     q = _query("example.com", 1)
     srv._sock.recvfrom.return_value = (q, ("10.13.37.100", 5353))
     srv._on_readable()
     srv._sock.sendto.assert_not_called()               # no wildcard lie to an authorized client
-    srv._upstream_sock.sendto.assert_called_once_with(q, (srv.upstream, 53))
-    assert srv._pending[q[0:2]] == ("10.13.37.100", 5353)
+    srv._upstream_sock.sendto.assert_called_once()
+    sent, upstream_addr = srv._upstream_sock.sendto.call_args.args
+    assert upstream_addr == (srv.upstream, 53)
+    assert sent[2:] == q[2:]                            # only the transaction id is rewritten
+    assert srv._pending[sent[0:2]] == (q[0:2], ("10.13.37.100", 5353))
+
+
+def test_two_clients_reusing_the_same_transaction_id_do_not_collide():
+    srv = _server(authorized={"10.13.37.100", "10.13.37.101"})
+    q = _query("example.com", 1)                        # same wire bytes, same client-chosen id
+    srv._forward(q, ("10.13.37.100", 5353))
+    srv._forward(q, ("10.13.37.101", 5353))
+    assert len(srv._pending) == 2                        # both entries survive, keyed by our own ids
 
 
 def test_upstream_reply_relayed_back_to_the_original_client():
     srv = _server(authorized={"10.13.37.100"})
     q = _query("example.com", 1)
-    srv._pending[q[0:2]] = ("10.13.37.100", 5353)
-    real_reply = q[0:2] + b"\x81\x80" + q[4:] + b"\xc0\x0c\x00\x01\x00\x01\x00\x00\x00\x3c\x00\x04" \
-                + bytes([93, 184, 216, 34])
+    srv._forward(q, ("10.13.37.100", 5353))
+    synth_id, _addr = srv._upstream_sock.sendto.call_args.args[0][0:2], None
+    real_reply = synth_id + b"\x81\x80" + q[4:] + \
+                b"\xc0\x0c\x00\x01\x00\x01\x00\x00\x00\x3c\x00\x04" + bytes([93, 184, 216, 34])
     srv._upstream_sock.recvfrom.return_value = (real_reply, ("1.1.1.1", 53))
     srv._on_upstream_readable()
-    srv._sock.sendto.assert_called_once_with(real_reply, ("10.13.37.100", 5353))
-    assert q[0:2] not in srv._pending                    # consumed, not leaked
+    sent_reply, addr = srv._sock.sendto.call_args.args
+    assert addr == ("10.13.37.100", 5353)
+    assert sent_reply[0:2] == q[0:2]                    # client's own id restored, not our synthetic one
+    assert sent_reply[2:] == real_reply[2:]
+    assert synth_id not in srv._pending                 # consumed, not leaked
 
 
 def test_upstream_reply_with_unknown_transaction_id_is_dropped():
@@ -126,6 +145,18 @@ def test_upstream_reply_with_unknown_transaction_id_is_dropped():
     srv._upstream_sock.recvfrom.return_value = (b"\x99\x99\x81\x80", ("1.1.1.1", 53))
     srv._on_upstream_readable()
     srv._sock.sendto.assert_not_called()
+
+
+def test_start_closes_the_socket_on_a_non_permission_bind_failure():
+    """Only PermissionError used to close the socket before re-raising; any other bind failure
+    (e.g. EADDRINUSE from a leftover run) leaked the fd instead."""
+    srv = DnsServer("wifit3tap0", answer_ip="10.13.37.1")
+    sock = MagicMock()
+    sock.bind.side_effect = OSError("Address already in use")
+    with patch("wifit3.net.dns.socket.socket", return_value=sock):
+        with pytest.raises(OSError):
+            srv.start()
+    sock.close.assert_called_once()
 
 
 def test_pending_map_is_bounded():

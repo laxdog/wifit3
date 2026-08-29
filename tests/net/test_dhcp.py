@@ -1,7 +1,11 @@
-"""Pure-protocol tests for the minimal DHCP encode/parse (no real socket)."""
+"""Pure-protocol tests for the minimal DHCP encode/parse (no real socket), plus DhcpServer's
+socket-teardown-on-failure path."""
 import struct
+from unittest.mock import MagicMock, patch
 
-from wifit3.net.dhcp import ACK, DISCOVER, OFFER, build_reply, parse
+import pytest
+
+from wifit3.net.dhcp import ACK, DISCOVER, DhcpServer, OFFER, build_reply, parse
 
 _MAC = bytes.fromhex("02aabbccddee")
 _XID = bytes.fromhex("11223344")
@@ -68,6 +72,18 @@ def test_build_reply_ack_carries_offer_type_distinctly():
                       server_ip="10.13.37.1", router_ip="10.13.37.1", dns_ip="10.13.37.1")
     assert _find_opt(offer[240:], 53) == bytes([OFFER])
     assert _find_opt(ack[240:], 53) == bytes([ACK])
+
+
+def test_start_closes_the_socket_on_a_non_permission_bind_failure():
+    """Only PermissionError used to close the socket before re-raising; any other bind failure
+    (e.g. EADDRINUSE from a leftover run) leaked the fd instead."""
+    srv = DhcpServer("wifit3tap0", server_ip="10.13.37.1", pool_start="10.13.37.100")
+    sock = MagicMock()
+    sock.bind.side_effect = OSError("Address already in use")
+    with patch("wifit3.net.dhcp.socket.socket", return_value=sock):
+        with pytest.raises(OSError):
+            srv.start()
+    sock.close.assert_called_once()
 
 
 def _find_opt(opts: bytes, tag: int):

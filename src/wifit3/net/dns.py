@@ -86,7 +86,13 @@ class DnsServer:
         self.upstream = upstream if upstream is not None else system_resolver()
         self._sock: Optional[socket.socket] = None
         self._upstream_sock: Optional[socket.socket] = None
-        self._pending: dict[bytes, Tuple[str, int]] = {}   # DNS transaction id -> client addr
+        # our own synthetic transaction id -> (client's original id, client addr). Two different
+        # clients can pick the same 16-bit id; keying on the client's own id (as this used to)
+        # let a second client's query silently overwrite the first's pending entry, misrouting
+        # whichever reply came back first. Assigning our own id per forward makes collisions
+        # structurally impossible instead of merely unlikely.
+        self._pending: dict[bytes, Tuple[bytes, Tuple[str, int]]] = {}
+        self._next_id = 0
 
     def start(self) -> None:
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -98,6 +104,9 @@ class DnsServer:
         except PermissionError as exc:
             sock.close()
             raise TapPermissionError(SETCAP_HINT) from exc
+        except OSError:
+            sock.close()
+            raise
         sock.setblocking(False)
         upstream_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         upstream_sock.setblocking(False)
@@ -140,9 +149,11 @@ class DnsServer:
             return
         if len(self._pending) >= _MAX_PENDING:
             self._pending.pop(next(iter(self._pending)))     # drop the oldest, bound the growth
-        self._pending[query[0:2]] = client_addr
+        synth_id = struct.pack("!H", self._next_id)
+        self._next_id = (self._next_id + 1) % 0x10000
+        self._pending[synth_id] = (query[0:2], client_addr)
         try:
-            self._upstream_sock.sendto(query, (self.upstream, _PORT))
+            self._upstream_sock.sendto(synth_id + query[2:], (self.upstream, _PORT))
         except OSError:
             logger.debug("dns: upstream forward failed", exc_info=True)
 
@@ -151,10 +162,11 @@ class DnsServer:
             data, _addr = self._upstream_sock.recvfrom(512)
         except (BlockingIOError, OSError):
             return
-        client_addr = self._pending.pop(data[0:2], None) if len(data) >= 2 else None
-        if client_addr is None:
+        pending = self._pending.pop(data[0:2], None) if len(data) >= 2 else None
+        if pending is None:
             return
+        client_id, client_addr = pending
         try:
-            self._sock.sendto(data, client_addr)
+            self._sock.sendto(client_id + data[2:], client_addr)
         except OSError:
             logger.debug("dns: reply relay failed", exc_info=True)

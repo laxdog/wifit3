@@ -51,6 +51,12 @@ _CAPTIVE_CHECK_RESPONSES: dict[str, tuple[int, str, str]] = {
 }
 _STATUS_REASON = {200: "OK", 204: "No Content", 404: "Not Found"}
 
+# Requested by real browsers on every navigation regardless of whether the page declares one --
+# unlike a page's own <link>/<img>/<script> refs (_asset_refs), this isn't something the fetched
+# page's HTML ever lists, so it would otherwise fall to the catch-all "this is the real portal's
+# own submit link" branch and silently pre-authorize the client before they see the form.
+_BROWSER_AUTO_PATHS = frozenset({"/favicon.ico"})
+
 # Apple's CNA sheet reacts to its OWN webview navigating to hotspot-detect.html and seeing the
 # exact expected body -- it closes itself right then, rather than waiting out its own background
 # recheck timer. Redirecting the POST response there (only for CNA's own browser, identified by
@@ -87,6 +93,9 @@ class HttpPortalServer:
         except PermissionError as exc:
             sock.close()
             raise TapPermissionError(SETCAP_HINT) from exc
+        except OSError:
+            sock.close()
+            raise
         sock.listen(16)
         self._server = await asyncio.start_server(self._handle, sock=sock)
 
@@ -118,6 +127,8 @@ class HttpPortalServer:
                 await self._respond(writer, 200, self.page)
             elif path_only in _CAPTIVE_CHECK_RESPONSES:
                 await self._redirect(writer, "/")
+            elif path_only in _BROWSER_AUTO_PATHS:
+                await self._respond_raw(writer, 404, "text/plain", "Not Found")
             else:
                 # Not "/", not a known OS background check, not a page asset: this is the real
                 # portal's own submit/continue link -- nodogsplash and openNDS both use
