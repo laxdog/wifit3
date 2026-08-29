@@ -18,10 +18,8 @@ def probe_req(bssid: bytes, our_mac: bytes, ssid: str) -> bytes:
 
 
 def probe_resp(bssid: bytes, ssid: str, channel: int, secured: bool = True) -> bytes:
-    """Forged Probe Response with Addr1 zeroed. The caller splices the requesting client's MAC
-    into bytes [4:10] before injecting, so build once and re-splice per probe. The TSF timestamp
-    is stamped at build time. ``secured=False`` drops Privacy + the RSN IE: an open twin must not
-    advertise security a client would prompt for a password over."""
+    """Forged Probe Response with Addr1 zeroed for the caller to splice the client's MAC into
+    before each injection. ``secured=False`` drops Privacy + the RSN IE for an open twin."""
     hdr = b"\x50\x00" + b"\x00\x00" + b"\x00" * 6 + bssid + bssid + b"\x00\x00"
     cap = _CAPABILITY_INFO | (_CAP_PRIVACY if secured else 0)
     fixed = (struct.pack("<Q", int(time.time() * 1_000_000))

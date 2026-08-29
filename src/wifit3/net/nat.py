@@ -65,9 +65,8 @@ class NatGateway:
         self._undo: List[Callable[[], None]] = []
 
     def start(self) -> None:
-        """Raises on failure, after rolling back anything this call already applied. Never
-        raises if there's simply no internet-connected interface to share (``uplink`` stays
-        None): that's a normal, non-fatal condition, not a bring-up bug."""
+        """Raises on failure, after rolling back anything already applied -- except when there's
+        no internet-connected interface to share (``uplink`` stays None), which is normal."""
         uplink = default_route_iface()
         if uplink is None or uplink == self.tap_name:
             logger.info("nat: no internet-connected uplink found; running without one")

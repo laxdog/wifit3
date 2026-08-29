@@ -63,9 +63,8 @@ async def fetch_page_with_assets(tap_name: str, gateway_ip: str, *, dns_ip: Opti
 async def _fetch_with_redirects(tap_name: str, host: str, port: int, scheme: str, path: str,
                                 timeout: float, *, dns_ip: Optional[str] = None
                                 ) -> Tuple[Optional[bytes], str, int, str]:
-    """GET-with-redirects loop (following the target's own scheme changes, e.g. an http probe
-    redirected to an https login page); also returns where the chain landed, so a caller
-    fetching more from the same server (page assets) can start there, not back at port 80."""
+    """GET-with-redirects loop, following scheme changes (e.g. an http probe redirected to
+    https). Also returns where the chain landed, so a caller fetching assets can start there."""
     for _ in range(_MAX_REDIRECTS):
         status, headers, body = await _get(tap_name, host, port, scheme, path, timeout, dns_ip=dns_ip)
         if status is None:
