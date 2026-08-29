@@ -61,9 +61,10 @@ def _mounted_iface(name: str, channels=(1, 6, 11)):
                            supported_channels=list(channels), mac_address="02:11:22:33:44:55")
 
 
-def _mounted_target(channel=1, bssid="94:83:c4:8c:3f:78", akm_suites=(2,), pmf_required=False):
+def _mounted_target(channel=1, bssid="94:83:c4:8c:3f:78", akm_suites=(2,), pmf_required=False,
+                    wpa3=False, transition_mode=False):
     return SimpleNamespace(channel=channel, bssid=bssid, akm_suites=list(akm_suites),
-                           pmf_required=pmf_required)
+                           pmf_required=pmf_required, wpa3=wpa3, transition_mode=transition_mode)
 
 
 async def test_off_channel_dual_card_preset_picks_a_distinct_punter_and_spoofs_the_bssid():

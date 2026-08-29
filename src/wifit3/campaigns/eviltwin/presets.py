@@ -69,6 +69,12 @@ _SECURED_PRESETS = (EvilTwinPreset.WPA3_DOWNGRADE, EvilTwinPreset.PMF_SAFE_CSA,
 
 
 def eligible_presets(ap) -> tuple[EvilTwinPreset, ...]:
-    """Presets whose label makes sense for this target: the RSN-downgrade pair only when there's an
-    RSN to downgrade, ``OPEN_CLONE`` only when the target has none."""
-    return _OPEN_PRESETS if not ap.akm_suites else _SECURED_PRESETS
+    """Presets whose label makes sense for this target: ``OPEN_CLONE`` only with no RSN to
+    downgrade; ``WPA3_DOWNGRADE`` only against a genuine WPA3-transition AP (SAE and PSK both)."""
+    if not ap.akm_suites:
+        return _OPEN_PRESETS
+    if ap.wpa3 and ap.transition_mode:
+        return _SECURED_PRESETS
+    # WPA2-only or WPA3-only: no downgrade for the preset to name, and a client honoring
+    # Transition-Disable would refuse the twin regardless.
+    return tuple(p for p in _SECURED_PRESETS if p is not EvilTwinPreset.WPA3_DOWNGRADE)
